@@ -1,0 +1,8 @@
+# amiga_rpdo1.py needs nothing but the Python standard library.
+# Raw SocketCAN, deliberately: no python-can, no farm-ng packages, nothing
+# that can break between firmware versions or require a wheel on the Pi.
+#
+# The GPS scripts need these:
+
+pyserial>=3.5
+pyubx2>=1.2.38

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# machine-local device mapping, written by detect_devices.py --write
+.amiga_devices
+
+# field captures land here; commit them deliberately, not by accident
+logs/*.log
+!logs/candump-2026-10-21_165954.log
+logs/*.csv
+logs/*.ubx
