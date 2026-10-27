@@ -1,0 +1,13 @@
+# Bring can0 up configured whenever the adapter appears, including on USB
+# replug. The kernel creates the interface but leaves it down and without
+# bit timing, because it cannot know the bus rate.
+#
+# 250 kbps, sample point 0.875: the Amiga's NMEA 2000 bus, confirmed on the
+# wire with zero error frames.
+#
+# restart-ms 0 is deliberate. A bus-off does NOT auto-recover, so a fault is
+# loud instead of hidden behind a silently self-healing interface. After any
+# bus event check `ip -details -statistics link show can0` reads ERROR-ACTIVE.
+#
+# Check `which ip` - some systems have /usr/sbin/ip rather than /sbin/ip.
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="can0", RUN+="/sbin/ip link set can0 up type can bitrate 250000 sample-point 0.875 restart-ms 0"

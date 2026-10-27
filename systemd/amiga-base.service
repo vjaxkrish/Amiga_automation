@@ -1,0 +1,16 @@
+[Unit]
+Description=Amiga RTK base station
+After=multi-user.target
+
+[Service]
+Type=simple
+User=amiga-base
+WorkingDirectory=/home/amiga-base/base
+ExecStart=/usr/bin/python3 /home/amiga-base/base/base_station.py run
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
