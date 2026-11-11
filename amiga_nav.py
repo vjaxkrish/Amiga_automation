@@ -6,6 +6,7 @@ amiga_nav.py - Phase 0 step 6. Pure pursuit path following and waypoint drive.
     follow   <csv>              drive the path recorded in that log
     goto     <lat> <lon>        drive to one point and stop
     mission  <json>             drive the marks in a rover_log teach summary
+    plan     <json>             print what mission would do. No hardware.
 
 `replay` needs no hardware and no robot. It starts a simulated vehicle
 offset from the path and reports whether the controller converges and what
@@ -35,29 +36,21 @@ import serial
 #  CALIBRATION - verify these on the machine before trusting any of it
 # ============================================================================
 
-# The LG580P reports heading 180 deg from the direction of travel with the
-# mast wired Antenna-1 forward, Antenna-2 rear. Measured 2026-10-27 against
-# course-over-ground: circular mean -177.6 deg over 1839 moving samples,
-# circular sd 5.5 deg. Set to 0.0 if the antenna cables are ever swapped.
-HEADING_OFFSET_DEG = 180.0
+# HEADING_OFFSET_DEG and ANTENNA_OFFSET_M live in vehicle.py, shared with
+# rover_log.py. They used to be defined separately in each file and drifted
+# apart (0.65 here, 0.794 there), and rover_log never applied the heading
+# offset at all. See vehicle.py and docs/calibration.md.
+from vehicle import (ANTENNA_OFFSET_M, HEADING_OFFSET_DEG, EARTH_R,
+                     true_heading, rotation_centre, metres_between)
 
-# Sign of the angular rate field in AmigaRpdo1. NOT YET VERIFIED on the wire.
-# +1 means positive mrad/s turns the vehicle left (counter-clockwise seen
-# from above). If the robot steers away from the path in `follow`, flip this
-# to -1. Check it with amiga_teleop.py before driving a path.
+# Sign of the angular rate field in AmigaRpdo1. Verified on the wire
+# 2026-10-27: positive mrad/s turns the vehicle left (counter-clockwise seen
+# from above).
 ANGULAR_SIGN = +1
 
 # Measured on turf, 2026-10-27: below ~40 mm/s the machine does not break
 # static friction. At 40 mm/s it stops immediately on a zero command, so no
 # deceleration overshoot to compensate for down here.
-# The GNSS antenna sits forward of the vehicle's centre of rotation, so a
-# turn in place swings it through an arc of chord 2*L*sin(theta/2) even
-# though the machine has not translated. Measured 2026-10-27: a 167 deg
-# square-up moved the reported position 117 cm, a 75 deg one moved it 90 cm.
-# All control therefore runs on the rotation centre, not on the antenna.
-# Measure with: python3 amiga_nav.py calib-offset
-ANTENNA_OFFSET_M = 0.65        # antenna ahead of the rotation centre
-
 CREEP_SPEED_MM_S = 40
 
 # Measured on turf, 2026-10-27: below roughly 150-200 mrad/s the machine does
@@ -135,8 +128,19 @@ MAX_START_DISTANCE_M = 20.0    # refuse a mission whose first point is further
 # Safety gates
 VERBOSE = True                 # one line per state change and 4 Hz otherwise
 REQUIRE_RTK_FIXED = True
-MAX_DATA_AGE_S = 0.5           # stop if position or heading goes stale
-MAX_CORR_AGE_S = 5.0           # stop if corrections stop arriving
+MAX_DATA_AGE_S = 0.5           # position or heading older than this is a GPS fault
+MAX_CORR_AGE_S = 5.0           # corrections older than this is a GPS fault
+
+# GPS faults HOLD rather than abort. The machine stops where it is, keeps
+# AUTO_ACTIVE alive with zero commands (so neither the watchdog nor the
+# operator has to intervene), and carries on when the fix is back. Ending
+# the run on the first float meant a two-second multipath blip ended a
+# 100-plot session. Only after GPS_HOLD_MAX_S does it give up.
+GPS_HOLD_MAX_S = 90.0          # give up waiting for the fix after this
+# A fix that has just come back is not trusted at once - a freshly resolved
+# ambiguity can be wrong, and it shows as a jump that settles. Require it to
+# hold this long before moving again.
+GPS_RESUME_GOOD_S = 2.0
 
 # ============================================================================
 #  Hardware
@@ -157,8 +161,6 @@ CAN_FRAME = struct.Struct("<IB3x8s")
 
 STATE_AUTO_READY = 4
 STATE_AUTO_ACTIVE = 5
-
-EARTH_R = 6371000.0
 
 
 # ============================================================================
@@ -238,15 +240,66 @@ def load_path_csv(path, min_spacing=0.25):
     return out
 
 
-def load_marks_json(path):
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_marks_json(path, verbose=True):
+    """Teach summary -> list of marks, each a dict:
+        label, lat, lon     rotation centre to drive to
+        heading             TRUE vehicle heading when taught, or None
+        fix_q, pos_sd_cm    teach quality where recorded
+
+    The rotation centre is RECOMPUTED from the stored antenna fix and heading
+    using the current vehicle.py constants, rather than trusted from the
+    file. That makes the mark file independent of whatever offset the logger
+    happened to use, and it repairs files taught before 2026-11-11, which
+    applied the antenna offset along the RAW receiver heading - 180 deg
+    wrong - and so stored a centre 1.6 m in front of the real one.
+
+    Format 1 (no "format" key): heading_deg is the raw receiver value.
+    Format 2: heading_deg is the true vehicle heading."""
     with open(path) as fh:
         data = json.load(fh)
+    fmt = int(data.get("format", 1))
     out = []
+    moved = []
     for m in data.get("marks", []):
-        if m.get("lat") and m.get("lon"):
-            out.append((m["label"], float(m["lat"]), float(m["lon"])))
+        ant_lat, ant_lon = _f(m.get("ant_lat")), _f(m.get("ant_lon"))
+        hdg = _f(m.get("heading_deg"))
+        if hdg is not None and fmt < 2:
+            hdg = true_heading(hdg)
+        if ant_lat is not None and ant_lon is not None and hdg is not None:
+            lat, lon = rotation_centre(ant_lat, ant_lon, hdg)
+        else:
+            lat, lon = _f(m.get("lat")), _f(m.get("lon"))
+        if lat is None or lon is None:
+            continue
+        old_lat, old_lon = _f(m.get("lat")), _f(m.get("lon"))
+        if old_lat is not None and old_lon is not None:
+            d = metres_between(old_lat, old_lon, lat, lon)
+            if d > 0.01:
+                moved.append((m.get("label"), d))
+        out.append({"label": m["label"], "lat": lat, "lon": lon,
+                    "heading": hdg, "fix_q": str(m.get("fix_q", "")),
+                    "pos_sd_cm": _f(m.get("pos_sd_cm"))})
     if not out:
         raise SystemExit(f"no marks in {path}")
+    if verbose and moved:
+        worst = max(d for _, d in moved)
+        print(f"note: {len(moved)} of {len(out)} marks re-derived from the "
+              f"antenna fix with the current vehicle.py constants "
+              f"(moved up to {worst*100:.0f} cm from the stored centre).")
+        if fmt < 2:
+            print("      This file predates the 2026-11-11 heading fix; the "
+                  "stored centres were wrong and are not used.")
+    bad = [m["label"] for m in out if m["fix_q"] and m["fix_q"] != "4"]
+    if verbose and bad:
+        print(f"WARNING: taught without RTK fixed: {', '.join(bad)}. "
+              f"Re-teach these.")
     return out
 
 
@@ -532,8 +585,7 @@ class Rover:
                 age = max(0.0, time.time() - st["t_wall"])
                 self.t_pos = now - age
                 if st.get("heading_deg") is not None:
-                    self.heading = (st["heading_deg"]
-                                    + HEADING_OFFSET_DEG) % 360.0
+                    self.heading = true_heading(st["heading_deg"])
                     self.t_head = now - age
             self._poll_can(now)
             return
@@ -566,7 +618,7 @@ class Rover:
                     h = float(f[8])
                 except (ValueError, IndexError):
                     continue
-                self.heading = (h + HEADING_OFFSET_DEG) % 360.0
+                self.heading = true_heading(h)
                 self.t_head = now
 
         self._poll_can(now)
@@ -593,21 +645,34 @@ class Rover:
         self.sock.send(CAN_FRAME.pack(
             COBID_RPDO1, 8, struct.pack("<Bhh3x", state, lin, ang)))
 
-    def unsafe(self, now):
-        """Return a reason to stop, or None."""
+    def gps_fault(self, now):
+        """A reason the POSITION cannot be trusted right now, or None.
+
+        These are recoverable: a multipath blip, a dropped radio packet, the
+        receiver briefly falling to float. drive_loop holds the machine still
+        and waits for them to clear rather than ending the run."""
         if self.t_pos is None or now - self.t_pos > MAX_DATA_AGE_S:
             return "position stale"
         if self.t_head is None or now - self.t_head > MAX_DATA_AGE_S:
             return "heading stale"
-        if self.t_can is None or now - self.t_can > MAX_DATA_AGE_S:
-            return "CAN stale"
         if REQUIRE_RTK_FIXED and self.fix_q != "4":
             return f"fix quality {self.fix_q}, want 4"
         if self.corr_age is not None and self.corr_age > MAX_CORR_AGE_S:
             return f"corrections {self.corr_age:.1f} s old"
+        return None
+
+    def hard_fault(self, now):
+        """A reason the MACHINE cannot be commanded, or None. Not waited out:
+        CAN gone or the Dashboard out of auto needs a person."""
+        if self.t_can is None or now - self.t_can > MAX_DATA_AGE_S:
+            return "CAN stale"
         if self.state not in (STATE_AUTO_READY, STATE_AUTO_ACTIVE):
             return f"dashboard state {self.state}, not auto"
         return None
+
+    def unsafe(self, now):
+        """Return a reason to stop, or None."""
+        return self.hard_fault(now) or self.gps_fault(now)
 
 
 def wait_ready(rover, timeout=600.0):
@@ -632,31 +697,134 @@ def wait_ready(rover, timeout=600.0):
     return False
 
 
-def drive_loop(rover, step_fn, label=""):
-    """Run step_fn(now, rover) -> (speed, angular, done, status). 20 Hz."""
+class Keyboard:
+    """Non-blocking 'q' to stop. Does nothing when stdin is not a terminal
+    (a test harness, or a run started from a script)."""
+
+    def __init__(self):
+        self.fd = None
+        self.old = None
+        try:
+            if sys.stdin.isatty():
+                self.fd = sys.stdin.fileno()
+                self.old = termios.tcgetattr(self.fd)
+                tty.setcbreak(self.fd)
+        except (termios.error, ValueError, OSError):
+            self.fd = None
+
+    def quit_pressed(self):
+        if self.fd is None:
+            return False
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1).lower() == "q"
+        return False
+
+    def restore(self):
+        if self.fd is not None and self.old is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+
+class GpsHold:
+    """Tracks a GPS-fault hold: when it started, why, and whether the fix
+    has been good for long enough to move again."""
+
+    def __init__(self):
+        self.since = None          # monotonic time the hold began
+        self.reason = None
+        self.good_since = None     # fix good again since this time
+        self.count = 0             # holds in this leg
+        self.total_s = 0.0         # time spent holding in this leg
+
+    @property
+    def active(self):
+        return self.since is not None
+
+    def update(self, now, gps_why):
+        """Return 'run', 'hold', 'resume' (hold just ended) or 'timeout'."""
+        if not self.active:
+            if gps_why is None:
+                return "run"
+            self.since, self.reason, self.good_since = now, gps_why, None
+            self.count += 1
+            return "hold"
+        if gps_why is not None:
+            self.reason = gps_why
+            self.good_since = None
+            if now - self.since > GPS_HOLD_MAX_S:
+                return "timeout"
+            return "hold"
+        if self.good_since is None:
+            self.good_since = now
+        if now - self.good_since >= GPS_RESUME_GOOD_S:
+            self.total_s += now - self.since
+            self.since = None
+            return "resume"
+        return "hold"
+
+
+def drive_loop(rover, step_fn, label="", on_resume=None, stats=None):
+    """Run step_fn(now, rover) -> (speed, angular, done, status). 20 Hz.
+
+    GPS faults (stale position or heading, fix not RTK fixed, old
+    corrections) put the loop in a HOLD: zero speed, AUTO_ACTIVE kept alive,
+    step_fn not called. When the fix has been good for GPS_RESUME_GOOD_S it
+    calls on_resume(now, held_s) so the controller can shift its timers, and
+    carries on. Hard faults (CAN, Dashboard state) stop immediately.
+
+    stats, if given, is a dict filled with hold count and time."""
     period = 1.0 / CONTROL_HZ
     nxt = time.monotonic()
     t_start = nxt
     last_line = 0.0
     last_word = None
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
+    kb = Keyboard()
+    hold = GpsHold()
+    last_hold_print = 0.0
     stopped_why = None
     try:
-        tty.setcbreak(fd)
         while True:
             now = time.monotonic()
             rover.poll(now)
 
-            if select.select([sys.stdin], [], [], 0)[0]:
-                if sys.stdin.read(1).lower() == "q":
-                    stopped_why = "operator"
-                    break
+            if kb.quit_pressed():
+                stopped_why = "operator"
+                break
 
-            why = rover.unsafe(now)
+            why = rover.hard_fault(now)
             if why:
                 stopped_why = why
                 break
+
+            h = hold.update(now, rover.gps_fault(now))
+            if h == "timeout":
+                stopped_why = (f"GPS lost {now - hold.since:.0f} s "
+                               f"({hold.reason}), gave up")
+                break
+            if h == "resume":
+                print(f"  {now - t_start:6.2f}  {label}GPS back, resuming "
+                      f"(hold #{hold.count})")
+                if on_resume is not None:
+                    on_resume(now)
+            if h == "hold":
+                # Keep commanding: zero motion, AUTO_ACTIVE, at the normal
+                # rate. Going silent would trip the watchdog, and that needs
+                # a person at the screen.
+                if now >= nxt:
+                    try:
+                        rover.send(STATE_AUTO_ACTIVE, 0, 0)
+                    except OSError as e:
+                        stopped_why = f"CAN TX failed ({e.errno})"
+                        break
+                    nxt += period
+                    if nxt < now:
+                        nxt = now + period
+                if now - last_hold_print >= 2.0:
+                    last_hold_print = now
+                    print(f"  {now - t_start:6.2f}  {label}HOLD  {hold.reason}"
+                          f"  ({now - hold.since:4.1f} s of "
+                          f"{GPS_HOLD_MAX_S:.0f})")
+                time.sleep(0.002)
+                continue
 
             speed, ang, done, status = step_fn(now, rover)
             if done:
@@ -686,7 +854,12 @@ def drive_loop(rover, step_fn, label=""):
                 last_word = word
             time.sleep(0.002)
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        kb.restore()
+        if hold.active:
+            hold.total_s += time.monotonic() - hold.since
+        if stats is not None:
+            stats["gps_holds"] = hold.count
+            stats["gps_hold_s"] = round(hold.total_s, 1)
         for _ in range(10):
             try:
                 rover.send(STATE_AUTO_READY, 0, 0)
@@ -749,6 +922,19 @@ class GotoController:
     def _release(self):
         self.turn_dir = None
         self.turn_start = None
+
+    def on_resume(self, now):
+        """Called by drive_loop after a GPS hold. The leg carries on with
+        its locked approach line and latched turn direction intact - starting
+        the leg afresh would re-aim at a target that may be 5 cm away, where
+        the bearing is pure noise, and could turn the machine in place inside
+        a plot. Only the clocks are reset, because the machine sat still."""
+        if self.turn_start is not None:
+            self.turn_start = now              # stall timer restarts
+        if self.creep_since is not None:
+            self.creep_since = now             # re-earn the settle gate
+        self.pulse_until = 0.0
+        self.pulse_rest = now + PULSE_REST_S   # settle, re-measure, then pulse
 
     def step(self, now, rover):
         x, y = control_point(self.frame, rover.lat, rover.lon, rover.heading)
@@ -908,7 +1094,8 @@ def cmd_goto(args):
             fh = bearing_to(tx, ty)      # end facing the way it approached
         print(f"  final heading: {'none' if fh is None else f'{fh:.1f} deg'}")
         print("  q to stop\n")
-        drive_loop(rover, make_goto_step(frame, tx, ty, fh))
+        ctl = GotoController(frame, tx, ty, fh)
+        drive_loop(rover, ctl.step, on_resume=ctl.on_resume)
     finally:
         rover.close()
     return 0
@@ -956,64 +1143,200 @@ def cmd_follow(args):
     return 0
 
 
+BIG_TURN_DEG = 20.0             # final turns above this are flagged in the plan
+
+
+def final_heading_for(mark, approach_brg, override=None):
+    """Heading to square up to at a mark.
+
+    The TAUGHT heading, so each plot is imaged facing the way it was taught
+    and the robot turns only as much as it did then. A single --heading for
+    the whole mission is wrong on a serpentine route: every second row is
+    driven the other way, and pinning it to one bearing turns the machine
+    180 deg in place on every plot of that row - the pivot that took the
+    motors to 220 F and scuffs the turf."""
+    if override is not None:
+        return override
+    if mark.get("heading") is not None:
+        return mark["heading"]
+    return approach_brg
+
+
+def plan_legs(frame, marks, start_xy, override=None):
+    """Leg-by-leg plan: distance, approach bearing, final heading, and the
+    in-place turn that final heading implies on arrival."""
+    legs = []
+    px, py = start_xy
+    for m in marks:
+        tx, ty = frame.to_xy(m["lat"], m["lon"])
+        d = math.hypot(tx - px, ty - py)
+        brg = bearing_to(tx - px, ty - py) if d > 1e-6 else None
+        fh = final_heading_for(m, brg, override)
+        turn = wrap180(fh - brg) if (fh is not None and brg is not None) else 0.0
+        legs.append({"label": m["label"], "dist": d, "approach": brg,
+                     "final": fh, "turn": turn})
+        px, py = tx, ty
+    return legs
+
+
+def print_plan(legs):
+    print(f"  {'mark':<10} {'leg m':>6} {'approach':>9} {'final':>7} {'turn':>7}")
+    for L in legs:
+        ap = "-" if L["approach"] is None else f"{L['approach']:.1f}"
+        fh = "-" if L["final"] is None else f"{L['final']:.1f}"
+        flag = "   <- turns in place" if abs(L["turn"]) > BIG_TURN_DEG else ""
+        print(f"  {L['label']:<10} {L['dist']:6.2f} {ap:>9} {fh:>7} "
+              f"{L['turn']:+7.1f}{flag}")
+    big = [L["label"] for L in legs if abs(L["turn"]) > BIG_TURN_DEG]
+    if big:
+        print(f"\n  {len(big)} mark(s) end with a turn over {BIG_TURN_DEG:.0f} deg: "
+              f"{', '.join(big)}.\n  That should only be headland transit "
+              f"points. A plot here means it was taught facing a different "
+              f"way than it is approached.")
+
+
+def cmd_plan(args):
+    """Print the mission plan from a teach file. No hardware."""
+    marks = load_marks_json(args.path)
+    frame = Frame(marks[0]["lat"], marks[0]["lon"])
+    legs = plan_legs(frame, marks, frame.to_xy(marks[0]["lat"], marks[0]["lon"]),
+                     args.heading)
+    print(f"{len(marks)} marks from {args.path}\n")
+    print_plan(legs)
+    return 0
+
+
+RUN_COLUMNS = ["t_utc", "label", "result", "stop_err_cm", "along_cm",
+               "cross_cm", "heading_err_deg", "fix_q", "corr_age_s",
+               "gps_ok_at_capture", "gps_fault_in_dwell", "gps_holds",
+               "gps_hold_s", "lat", "lon", "heading_deg"]
+
+
+def stop_error(frame, rover, tx, ty, final_hdg):
+    """Where the rotation centre stopped relative to the mark, in the frame
+    of the final heading: along > 0 is PAST the mark, cross > 0 is to the
+    LEFT. This is the residual a crop in post-processing would undo."""
+    x, y = control_point(frame, rover.lat, rover.lon, rover.heading)
+    ex, ey = x - tx, y - ty
+    ref = final_hdg if final_hdg is not None else rover.heading
+    along, left = vehicle_frame(ex, ey, ref)
+    herr = wrap180(rover.heading - ref)
+    return math.hypot(ex, ey), along, left, herr
+
+
 def cmd_mission(args):
     marks = load_marks_json(args.path)
-    rover = Rover()
-    rover.open()
-    done_path = os.path.splitext(args.path)[0] + "_completed.txt"
+    base = os.path.splitext(args.path)[0]
+    done_path = base + "_completed.txt"
     completed = set()
     if os.path.exists(done_path) and args.resume:
         completed = set(open(done_path).read().split())
         print(f"resuming, {len(completed)} already done")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_path = f"{base}_run_{stamp}.csv"
 
+    rover = Rover()
+    rover.open()
     try:
         if not wait_ready(rover):
             return 1
         frame = Frame(rover.lat, rover.lon)
-        todo = [m for m in marks if m[0] not in completed]
-        print(f"{len(todo)} waypoints\n")
+        todo = [m for m in marks if m["label"] not in completed]
+        if not todo:
+            print("nothing left to do")
+            return 0
 
-        first = todo[0]
-        fx, fy = frame.to_xy(first[1], first[2])
-        cx, cy = frame.to_xy(rover.lat, rover.lon)
-        d0 = math.hypot(fx - cx, fy - cy)
-        if d0 > MAX_START_DISTANCE_M:
-            print(f"refusing: first waypoint {d0:.1f} m away, "
+        cx, cy = control_point(frame, rover.lat, rover.lon, rover.heading)
+        legs = plan_legs(frame, todo, (cx, cy), args.heading)
+        print(f"{len(todo)} waypoints\n")
+        print_plan(legs)
+        print()
+        if args.heading is not None:
+            print(f"NOTE: --heading {args.heading:.1f} overrides the taught "
+                  f"heading at EVERY mark.\n")
+
+        if legs[0]["dist"] > MAX_START_DISTANCE_M:
+            print(f"refusing: first waypoint {legs[0]['dist']:.1f} m away, "
                   f"limit {MAX_START_DISTANCE_M} m")
             return 1
 
-        with open(done_path, "a") as done_fh:
-            for label, la, lo in todo:
-                tx, ty = frame.to_xy(la, lo)
-                cx, cy = frame.to_xy(rover.lat, rover.lon)
-                # args.heading pins every plot to the row bearing. Without it
-                # each plot squares to however it happened to be approached,
-                # which varies leg by leg.
-                final_hdg = args.heading
-                if final_hdg is None:
-                    final_hdg = bearing_to(tx - cx, ty - cy)
-                why = drive_loop(rover,
-                                 make_goto_step(frame, tx, ty, final_hdg),
-                                 label=f"{label}  ")
+        with open(done_path, "a") as done_fh, \
+                open(run_path, "w", buffering=1) as run_fh:
+            w = csvmod.writer(run_fh)
+            w.writerow(RUN_COLUMNS)
+            print(f"run log -> {run_path}\n")
+
+            for m in todo:
+                label = m["label"]
+                tx, ty = frame.to_xy(m["lat"], m["lon"])
+                cx, cy = control_point(frame, rover.lat, rover.lon,
+                                       rover.heading)
+                final_hdg = final_heading_for(m, bearing_to(tx - cx, ty - cy),
+                                              args.heading)
+                ctl = GotoController(frame, tx, ty, final_hdg)
+                stats = {}
+                why = drive_loop(rover, ctl.step, label=f"{label}  ",
+                                 on_resume=ctl.on_resume, stats=stats)
                 if why != "complete":
-                    print(f"  aborting at {label}: {why}")
+                    w.writerow([datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"), label, f"stopped: {why}"]
+                        + [""] * (len(RUN_COLUMNS) - 3))
+                    print(f"  stopping at {label}: {why}")
+                    print(f"  completed plots are in {done_path}; "
+                          f"carry on with --resume")
                     return 1
 
-                x, y = control_point(frame, rover.lat, rover.lon,
-                                     rover.heading)
-                err = math.hypot(tx - x, ty - y)
-                print(f"  {label}: stopped {err*100:.1f} cm from target, "
+                err, along, cross, herr = stop_error(frame, rover, tx, ty,
+                                                     final_hdg)
+                print(f"  {label}: stopped {err*100:.1f} cm from target "
+                      f"(along {along*100:+.1f}, cross {cross*100:+.1f} cm), "
                       f"dwell {args.dwell:.0f} s")
+
+                # Fix quality checked at the moment of capture - this is
+                # where it matters most. drive_loop only returns "complete"
+                # with a good fix, but say so explicitly and record it.
+                now = time.monotonic()
+                rover.poll(now)
+                gps_ok = rover.gps_fault(now) is None
+                fix_q, corr_age = rover.fix_q, rover.corr_age
 
                 # ---- capture hook goes here ----
                 # Trigger the camera app, confirm it wrote, then continue.
                 # Flag and continue on failure; do not abort the session.
+                # Pass it: label, gps_ok, err/along/cross, fix_q, corr_age.
+
+                dwell_fault = None
                 t_end = time.monotonic() + args.dwell
                 while time.monotonic() < t_end:
-                    rover.poll(time.monotonic())
+                    now = time.monotonic()
+                    rover.poll(now)
+                    hf = rover.hard_fault(now)
+                    if hf:
+                        print(f"  stopping during dwell at {label}: {hf}")
+                        return 1
+                    gf = rover.gps_fault(now)
+                    if gf and dwell_fault is None:
+                        dwell_fault = gf
                     rover.send(STATE_AUTO_ACTIVE, 0, 0)
                     time.sleep(1.0 / CONTROL_HZ)
 
+                result = "ok"
+                if not gps_ok or dwell_fault:
+                    result = "flag_gps"
+                    print(f"  {label}: FLAGGED - GPS "
+                          f"{'not good at capture' if not gps_ok else dwell_fault}")
+                if stats.get("gps_holds"):
+                    print(f"  {label}: {stats['gps_holds']} GPS hold(s), "
+                          f"{stats['gps_hold_s']:.0f} s")
+                w.writerow([
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    label, result, f"{err*100:.2f}", f"{along*100:.2f}",
+                    f"{cross*100:.2f}", f"{herr:.2f}", fix_q,
+                    "" if corr_age is None else f"{corr_age:.1f}",
+                    int(gps_ok), dwell_fault or "",
+                    stats.get("gps_holds", 0), stats.get("gps_hold_s", 0.0),
+                    f"{rover.lat:.9f}", f"{rover.lon:.9f}",
+                    f"{rover.heading:.2f}"])
                 done_fh.write(label + "\n")
                 done_fh.flush()
 
@@ -1058,7 +1381,8 @@ def cmd_calib_offset(args):
         offset = chord / (2.0 * math.sin(half)) if math.sin(half) else 0.0
         print(f"\n  antenna moved {chord*100:.1f} cm over {args.turn:.0f} deg")
         print(f"  ANTENNA_OFFSET_M = {offset:.3f}")
-        print(f"  (currently set to {ANTENNA_OFFSET_M:.3f})")
+        print(f"  (currently {ANTENNA_OFFSET_M:.3f} in vehicle.py - average several "
+              f"readings before changing it)")
     finally:
         rover.close()
     return 0
@@ -1095,13 +1419,18 @@ def main():
     m.add_argument("path")
     m.add_argument("--resume", action="store_true")
     m.add_argument("--heading", type=float, default=None,
-                   help="square every plot to this bearing (the row bearing)")
+                   help="override: square EVERY mark to this bearing instead "
+                        "of its taught heading. Wrong on a serpentine route.")
     m.add_argument("--dwell", type=float, default=DWELL_S,
                    help=f"seconds stopped at each plot (default {DWELL_S:.0f})")
 
+    pl = sub.add_parser("plan", help="print the mission plan, no hardware")
+    pl.add_argument("path")
+    pl.add_argument("--heading", type=float, default=None)
+
     args = p.parse_args()
     fn = {"replay": cmd_replay, "follow": cmd_follow,
-          "goto": cmd_goto, "mission": cmd_mission,
+          "goto": cmd_goto, "mission": cmd_mission, "plan": cmd_plan,
           "calib-offset": cmd_calib_offset}[args.cmd]
     try:
         return fn(args)

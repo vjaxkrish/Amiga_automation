@@ -136,18 +136,28 @@ Want all four non-zero: GGA, PQTMTAR, 0x18E, RTCM bytes. Zero RTCM means the
 base is not reaching you. Zero PQTMTAR means heading is not resolving — check
 the mast cabling. Zero 0x18E means CAN is down or the Amiga is off.
 
-Then drive to each point on the pendant and press `m`:
+Then drive to each point on the pendant, **stop fully**, and press `m`:
 
 ```bash
 python3 rover_log.py teach
 ```
 
-`m` marks and labels sequentially — `plot_001`, `plot_002`, … `q` stops and
-writes `~/logs/rover_<timestamp>.json`.
+`m` averages **3 seconds** of readings — keep hands off the pendant — and
+labels sequentially, `plot_001`, `plot_002`, … `q` stops and writes
+`~/logs/rover_<timestamp>.json`.
 
-**Teach in the order you want them driven**, including transit waypoints at
-row ends. Marks are stored as the **rotation centre**, not the antenna
-position, which is what `amiga_nav` drives to.
+A mark is **refused** (with a beep, and the plot id not used up) if any
+reading in those 3 s was not RTK fixed, the wheels moved, or the readings
+scattered more than 2 cm. Wait for the fix, or move out of multipath, and
+press `m` again.
+
+**Teach the way it will be driven.** The real route, in the real order and
+the real direction — row 2 facing back down row 2 — stopped square to the
+row, including the headland transit points. Each mark records the heading it
+was taught at, and `mission` squares up to that. Teaching every plot facing
+the same way would make the machine spin in place at every plot of the
+reversed rows. Marks are stored as the **rotation centre**, which is what
+`amiga_nav` drives to.
 
 Restart the forwarder when done:
 
@@ -164,17 +174,36 @@ start engages MANUAL_ACTIVE, and RPDO1 is ignored entirely while in manual.
 This is a physical interlock and no software replaces it.
 
 ```bash
-python3 amiga_nav.py goto <lat> <lon> --heading <row bearing>
-python3 amiga_nav.py mission ~/logs/rover_<timestamp>.json --heading <bearing> --dwell 5
+python3 amiga_nav.py plan ~/logs/rover_<timestamp>.json      # check first, no motion
+python3 amiga_nav.py mission ~/logs/rover_<timestamp>.json --dwell 5
 python3 amiga_nav.py mission <file> --resume      # skip completed plots
+python3 amiga_nav.py goto <lat> <lon> --heading <row bearing>
 ```
+
+`plan` lists every leg and flags any mark that ends with a turn over 20°.
+Only headland transit points should be flagged; a flagged plot was taught
+facing the wrong way.
 
 First line of output should read `reading position and heading from
 rtcm_forward`. If it says `using the ports directly`, the state file is stale
 and you are back in the conflicting arrangement.
 
-`--heading` pins every plot to the row bearing. Without it each plot squares
-to whatever angle it happened to approach from, which varies leg by leg.
+Each mark squares up to the heading it was **taught** at. `--heading` still
+exists to force one bearing on every mark — **do not use it on a serpentine
+route**; it spins the machine 180° on every plot of the reversed rows.
+
+**If the fix drops** the machine stops where it is and prints `HOLD` with
+the reason. It stays in auto and carries on by itself once the fix has been
+back for 2 s. After 90 s without a fix it stops cleanly; fix the cause and
+re-run with `--resume`.
+
+Each run writes `<teachfile>_run_<UTC>.csv` next to the teach file: stop
+error along and across the row for every plot, fix status at capture, and
+any GPS holds. Copy it off with the logs.
+
+Teach files from before 11 Nov 2026 still load — their marks are re-derived
+from the stored antenna fix — but they were taught one reading at a time
+and possibly facing the wrong way. Re-teach for real runs.
 
 `q` stops. **The pendant X button overrides the Pi entirely** and is the real
 abort — it works whether or not the software is responding.

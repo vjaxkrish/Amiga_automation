@@ -4,6 +4,10 @@ Every number here was measured on the College Station Amiga on 27 Oct 2026.
 They are properties of **this machine and this mast**, not of the software.
 Re-measure all of them on the Dallas machine before trusting any of it.
 
+`ANTENNA_OFFSET_M` and `HEADING_OFFSET_DEG` are defined **once**, in
+`vehicle.py`, and imported by `amiga_nav.py` and `rover_log.py`. Change them
+there and nowhere else.
+
 ---
 
 ## ANTENNA_OFFSET_M = 0.80
@@ -27,10 +31,20 @@ Observed before the fix, during a four-waypoint mission:
 
 The error scales as the chord of the turn, which is the signature.
 
-**Fix:** all control runs on the rotation centre. `control_point()` in
-`amiga_nav.py` and `rotation_centre()` in `rover_log.py` shift the antenna
-fix back along the heading. Both files carry their own copy of the constant
-and **they must match**.
+**Fix:** all control runs on the rotation centre. `vehicle.rotation_centre()`
+shifts the antenna fix back along the **true** heading; `control_point()` in
+`amiga_nav.py` does the same in local metres. Both use the one constant in
+`vehicle.py`.
+
+**What went wrong before 11 Nov 2026.** The constant was copied into both
+files and the copies drifted (0.65 in `amiga_nav.py`, 0.794 in
+`rover_log.py`), and `rover_log.py` applied it along the **raw** receiver
+heading, which points backwards on this mast. Taught marks therefore sat
+1.6 m in front of the true rotation centre, and a replay stopped about
+**1.44 m past** the taught spot - more than one plot pitch. The controller's
+own error report could not show this, because it measured against the same
+wrong mark. `amiga_nav.py` now re-derives every mark from its stored antenna
+fix and heading, so old teach files are repaired on load.
 
 **Measure with** `python3 amiga_nav.py calib-offset`, which spins 180 deg and
 halves the chord. Two readings gave 0.794 and 0.813 m; the spread is RTK
@@ -48,6 +62,9 @@ driving log: circular mean **-177.6 deg**, circular sd 5.5 deg.
 
 Independently confirmed: at a mark where the machine pointed straight at the
 next mark 12.7 m away on a bearing of 137.5 deg, raw heading read 317.3 deg.
+
+Applied in exactly one place, `vehicle.true_heading()`. Anything that reads
+PQTMTAR goes through it.
 
 **Set to 0.0 if the antenna cables are ever swapped.** The cheaper fix is to
 swap the cables and delete the constant, but it was left as software so the

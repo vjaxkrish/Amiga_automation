@@ -8,6 +8,7 @@
 | `follow <csv>` | drive the path recorded in that log |
 | `goto <lat> <lon>` | drive to one point and stop |
 | `mission <json>` | drive the marks from a `rover_log.py teach` summary |
+| `plan <json>` | print what `mission` would do, leg by leg. No hardware. |
 | `calib-offset` | spin 180 deg and measure the antenna offset |
 
 ---
@@ -128,14 +129,73 @@ the real abort.
 
 ---
 
+## GPS error: what cancels and what does not
+
+Teach-and-repeat with a fixed base cancels every error that is the same at
+teach time and at run time: base position, antenna offset, heading offset,
+and the sideways lean of the mast on sloped turf. They cancel only if the
+machine sits on the same patch, **facing the same way**. Rows alternate
+direction, so:
+
+**Teach each plot exactly as it will be driven** - the real route, in the
+real direction, stopped square to the row. Taught facing the other way, the
+lean and offset errors double instead of cancelling.
+
+What does not cancel is RTK noise (1-2 cm) and losing the fix. Noise is
+reduced at teach time by averaging; loss is handled by holding.
+
+### Marks are averaged and checked
+
+`rover_log.py` averages **3 s** of readings per mark, machine stopped, and
+refuses the mark - without using up the plot id - unless every reading is
+RTK fixed, the wheels did not turn, and the readings agree within 2 cm and
+0.5 deg. A single reading baked its noise into every future run.
+
+### Fix loss holds, it does not abort
+
+A GPS fault (position or heading stale, fix not RTK fixed, corrections over
+5 s old) puts `drive_loop` in a **hold**: zero speed, AUTO_ACTIVE kept alive,
+controller frozen. When the fix has been good for **2 s** it resumes the same
+leg - same locked approach line, same latched turn direction - rather than
+restarting it, because re-aiming at a target a few centimetres away would
+turn the machine in place inside the plot. After **90 s** it gives up and
+stops cleanly; `mission --resume` picks up where it left off.
+
+Hard faults - CAN silent, Dashboard out of auto - still stop at once.
+
+`GPS_HOLD_MAX_S` and `GPS_RESUME_GOOD_S` are the knobs.
+
+### Each mark squares to its taught heading
+
+`mission` turns to the heading each mark was **taught** with. The old
+`--heading` pinned every mark to one bearing, which on a serpentine route
+turned the machine 180 deg in place at every plot of every second row.
+`--heading` still exists as an override; do not use it on a serpentine.
+
+Run `amiga_nav.py plan <json>` before a mission. It flags any mark that ends
+with a turn over 20 deg. Only headland transit points should appear.
+
+### Every stop is logged
+
+`mission` writes `<teachfile>_run_<UTC>.csv`: per mark, the stop error
+(along the row, positive = past the mark; across, positive = left), heading
+error, fix quality and correction age at capture, any GPS fault during the
+dwell, and hold count and time. A plot with GPS trouble is marked
+`flag_gps` and the run carries on. The along/cross numbers are the residual
+a crop in post-processing would undo.
+
+---
+
 ## Known gaps
 
 - `follow` has had no field testing. Only `goto` and `mission` have driven.
-- The capture hook in `mission` is an empty comment. The camera trigger goes
-  there, and it should flag and continue on failure rather than aborting.
-- No check of fix quality immediately before a capture, which is where it
-  matters most.
+  **`AlignGate` (used only by `follow` and `replay`) turns the wrong way**
+  by the verified sign convention - positive bearing error returns a
+  positive (left) rate - and `replay`'s vehicle model has the matching
+  inverted sign, so simulation cannot catch it. Fix both before `follow`
+  drives.
+- The capture hook in `mission` is still an empty comment. It now has the
+  fix check and the stop error to hand; it needs the camera trigger.
 - Headland turns are handled by aligning in place then driving straight.
   Works on open ground, ungainly in a tight headland.
-- `ANTENNA_OFFSET_M` is duplicated in `amiga_nav.py` and `rover_log.py` and
-  must be kept in sync by hand.
+- No dead reckoning through an RTK dropout - the machine holds instead.

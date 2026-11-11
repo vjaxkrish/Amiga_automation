@@ -15,6 +15,14 @@ While running:
     n       mark and label the next mark with an incrementing plot id
     q       stop and write the summary
 
+A mark is not one reading. Pressing m starts a 3 s average with the machine
+STOPPED; the mark is refused, and the plot id not used up, unless every
+reading in that window is RTK fixed, the machine did not move, and the
+readings agree to within a couple of centimetres. Press m again to retry.
+Teach each plot exactly as it will be driven: same route, same direction,
+stopped square to the row. Errors that do not change between teach and
+replay then cancel - see docs/navigation.md.
+
 Output: logs/rover_YYYYmmdd_HHMMSS.csv plus a .json summary.
 
 Everything is sampled on one monotonic clock. Each source updates
@@ -35,9 +43,10 @@ import time
 import tty
 from datetime import datetime, timezone
 
-import json
-
 import serial
+
+from vehicle import (ANTENNA_OFFSET_M, HEADING_OFFSET_DEG, true_heading,
+                     rotation_centre, circular_mean_deg, metres_between)
 
 # --- devices ----------------------------------------------------------------
 
@@ -52,13 +61,19 @@ RADIO_BAUD = 57600
 COBID_TPDO1 = 0x18E
 CAN_FRAME = struct.Struct("<IB3x8s")
 
-# The GNSS antenna sits forward of the vehicle's centre of rotation, so the
-# antenna fix is not where the machine "is" for control purposes - a turn in
-# place swings it through an arc. Marks are therefore stored as the rotation
-# centre, which is what amiga_nav drives to. Keep this equal to
-# ANTENNA_OFFSET_M in amiga_nav.py; measure with `amiga_nav.py calib-offset`.
-ANTENNA_OFFSET_M = 0.794
-EARTH_R = 6371000.0
+# Marks are stored as the vehicle's rotation centre, which is what amiga_nav
+# drives to, computed with the shared constants in vehicle.py. The antenna
+# fix and TRUE heading are stored too, and amiga_nav re-derives the centre
+# from them, so a later change to ANTENNA_OFFSET_M does not strand old marks.
+MARK_FORMAT = 2
+
+# Averaging a mark. Measured noise on a stationary machine is ~1 cm; one
+# reading bakes that noise into every future run.
+MARK_AVG_S = 3.0               # average over this long, machine stopped
+MARK_MIN_SAMPLES = 3           # fewer GGA than this in the window: refuse
+MARK_MAX_POS_SD_M = 0.02       # readings scattered more than this: refuse
+MARK_MAX_HDG_SD_DEG = 0.5      # heading scattered more than this: refuse
+MARK_MAX_SPEED_MM_S = 10       # wheel speed above this: it was moving, refuse
 
 LOG_RATE_HZ = 10.0
 STALE_WARN_S = 1.0
@@ -68,7 +83,7 @@ OUT_DIR = os.path.expanduser("~/logs")
 COLUMNS = [
     "t_mono", "t_utc", "row_type", "label",
     "lat", "lon", "ctr_lat", "ctr_lon", "alt_m", "fix_q", "nsat", "hdop", "corr_age_s", "gga_age_s",
-    "heading_deg", "pitch_deg", "baseline_m", "head_q", "head_nsat", "tar_age_s",
+    "heading_deg", "heading_true_deg", "pitch_deg", "baseline_m", "head_q", "head_nsat", "tar_age_s",
     "can_state", "speed_mm_s", "angular_mrad_s", "soc_pct", "can_age_s",
 ]
 
@@ -100,16 +115,53 @@ def read_state():
     return None
 
 
-def rotation_centre(lat, lon, heading_deg):
-    """Shift an antenna fix back along the heading to the rotation centre."""
-    if lat is None or lon is None or heading_deg is None:
-        return None, None
-    th = math.radians(heading_deg)
-    dn = -ANTENNA_OFFSET_M * math.cos(th)      # metres north
-    de = -ANTENNA_OFFSET_M * math.sin(th)      # metres east
-    clat = lat + math.degrees(dn / EARTH_R)
-    clon = lon + math.degrees(de / (EARTH_R * math.cos(math.radians(lat))))
-    return clat, clon
+def average_mark(gga, raw_headings, speeds):
+    """Average a stationary window into one mark.
+
+    gga:          list of parsed GGA dicts (lat, lon, fix_q)
+    raw_headings: list of PQTMTAR heading values, raw from the receiver
+    speeds:       list of CAN wheel speeds in mm/s
+
+    Returns (fields, None) on success or (None, reason) if the window is not
+    good enough to teach from."""
+    pts = [g for g in gga if g.get("lat") is not None and g.get("lon") is not None]
+    if len(pts) < MARK_MIN_SAMPLES:
+        return None, f"only {len(pts)} position readings in {MARK_AVG_S:.0f} s"
+    not_fixed = [g["fix_q"] for g in pts if g.get("fix_q") != "4"]
+    if not_fixed:
+        return None, (f"{len(not_fixed)} of {len(pts)} readings not RTK fixed "
+                      f"(fix {','.join(sorted(set(not_fixed)))})")
+    if speeds and max(abs(v) for v in speeds) > MARK_MAX_SPEED_MM_S:
+        return None, (f"machine moving ({max(abs(v) for v in speeds)} mm/s) - "
+                      f"stop fully before marking")
+    hdgs = [true_heading(h) for h in raw_headings if h is not None]
+    if not hdgs:
+        return None, "no heading readings"
+
+    lat = sum(g["lat"] for g in pts) / len(pts)
+    lon = sum(g["lon"] for g in pts) / len(pts)
+    sd = math.sqrt(sum(metres_between(lat, lon, g["lat"], g["lon"]) ** 2
+                       for g in pts) / len(pts))
+    if sd > MARK_MAX_POS_SD_M:
+        return None, (f"position scattered {sd*100:.1f} cm - multipath? "
+                      f"limit {MARK_MAX_POS_SD_M*100:.0f} cm")
+    hdg, hsd = circular_mean_deg(hdgs)
+    if hsd > MARK_MAX_HDG_SD_DEG:
+        return None, (f"heading scattered {hsd:.2f} deg, "
+                      f"limit {MARK_MAX_HDG_SD_DEG} deg")
+
+    clat, clon = rotation_centre(lat, lon, hdg)
+    return {
+        "lat": clat, "lon": clon,              # rotation centre: drive here
+        "ant_lat": lat, "ant_lon": lon,        # mean antenna fix
+        "heading_deg": round(hdg, 4),          # TRUE vehicle heading
+        "fix_q": "4",
+        "n_samples": len(pts),
+        "pos_sd_cm": round(sd * 100, 2),
+        "heading_sd_deg": round(hsd, 3),
+        "antenna_offset_m": ANTENNA_OFFSET_M,
+        "heading_offset_deg": HEADING_OFFSET_DEG,
+    }, None
 
 
 def nmea_ok(line):
@@ -290,6 +342,8 @@ def cmd_log(args):
     can = Source()
 
     marks = []
+    pending = None             # a mark being averaged: label, t_end, samples
+    rejected = 0
     plot_id = 1
     rows = 0
     rtcm_bytes = 0
@@ -306,8 +360,8 @@ def cmd_log(args):
 
     def snapshot(now, row_type="sample", label=""):
         g, a, c = gps.data, att.data, can.data
-        clat, clon = rotation_centre(g.get("lat"), g.get("lon"),
-                                     a.get("heading_deg"))
+        hdg_true = true_heading(a.get("heading_deg"))
+        clat, clon = rotation_centre(g.get("lat"), g.get("lon"), hdg_true)
         vals = {
             "t_mono": f"{now - t0:.3f}",
             "t_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -324,6 +378,7 @@ def cmd_log(args):
             "corr_age_s": g.get("corr_age_s", ""),
             "gga_age_s": f"{gps.age(now):.2f}" if gps.age(now) is not None else "",
             "heading_deg": f"{a['heading_deg']:.4f}" if a.get("heading_deg") is not None else "",
+            "heading_true_deg": f"{hdg_true:.4f}" if hdg_true is not None else "",
             "pitch_deg": f"{a['pitch_deg']:.4f}" if a.get("pitch_deg") is not None else "",
             "baseline_m": f"{a['baseline_m']:.4f}" if a.get("baseline_m") is not None else "",
             "head_q": a.get("head_q", ""),
@@ -369,12 +424,16 @@ def cmd_log(args):
                         d = parse_gga(f)
                         if d:
                             gps.update(d, now)
+                            if pending is not None:
+                                pending["gga"].append(d)
                             q = FIX_LABEL.get(d["fix_q"], d["fix_q"])
                             fix_counts[q] = fix_counts.get(q, 0) + 1
                     elif s.startswith("$PQTMTAR"):
                         d = parse_tar(f)
                         if d:
                             att.update(d, now)
+                            if pending is not None:
+                                pending["hdg"].append(d.get("heading_deg"))
 
                 # CAN
                 while True:
@@ -388,36 +447,52 @@ def cmd_log(args):
                     st, sp, ang = struct.unpack_from("<Bhh", data)
                     can.update({"state": st, "speed": sp, "angular": ang,
                                 "soc": data[7]}, now)
+                    if pending is not None:
+                        pending["spd"].append(sp)
 
                 # keyboard
                 if select.select([sys.stdin], [], [], 0)[0]:
                     c = sys.stdin.read(1).lower()
                     if c == "q":
                         break
-                    if c in ("m", "n"):
-                        label = f"plot_{plot_id:03d}" if (teach or c == "n") else f"mark_{len(marks)+1}"
-                        v = snapshot(now, "mark", label)
-                        # The mark's lat/lon is the ROTATION CENTRE, because
-                        # that is the point amiga_nav drives to. The antenna
-                        # fix is kept alongside it for reference.
-                        marks.append({
-                            "t_mono": v["t_mono"], "t_utc": v["t_utc"],
-                            "label": label,
-                            "lat": v["ctr_lat"] or v["lat"],
-                            "lon": v["ctr_lon"] or v["lon"],
-                            "ant_lat": v["lat"], "ant_lon": v["lon"],
-                            "fix_q": v["fix_q"],
-                            "heading_deg": v["heading_deg"],
-                            "antenna_offset_m": ANTENNA_OFFSET_M,
-                        })
+                    if c in ("m", "n") and pending is None:
+                        numbered = teach or c == "n"
+                        label = (f"plot_{plot_id:03d}" if numbered
+                                 else f"mark_{len(marks)+1}")
+                        pending = {"label": label, "numbered": numbered,
+                                   "t_end": now + MARK_AVG_S,
+                                   "gga": [], "hdg": [], "spd": []}
+                        sys.stdout.write(f"\r  {label}: hold still, averaging "
+                                         f"{MARK_AVG_S:.0f} s ...{' ' * 40}\n")
+
+                # finish a mark once its averaging window has closed
+                if pending is not None and now >= pending["t_end"]:
+                    label = pending["label"]
+                    fields, why = average_mark(pending["gga"], pending["hdg"],
+                                               pending["spd"])
+                    if fields is None:
+                        rejected += 1
+                        snapshot(now, "mark_rejected", label)
                         rows += 1
-                        if teach or c == "n":
+                        sys.stdout.write(
+                            f"\r  REFUSED {label}: {why}. "
+                            f"Not saved - press m to try again.\a\n")
+                    else:
+                        v = snapshot(now, "mark", label)
+                        rows += 1
+                        mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"],
+                                "label": label}
+                        mark.update(fields)
+                        marks.append(mark)
+                        if pending["numbered"]:
                             plot_id += 1
                         sys.stdout.write(
-                            f"\r  MARK {label}  "
-                            f"{marks[-1]['lat']},{marks[-1]['lon']}  "
-                            f"fix {FIX_LABEL.get(v['fix_q'], v['fix_q'])}"
-                            f"  (rotation centre)\n")
+                            f"\r  MARK {label}  {fields['lat']:.9f},"
+                            f"{fields['lon']:.9f}  hdg {fields['heading_deg']:.1f}"
+                            f"  sd {fields['pos_sd_cm']:.1f} cm / "
+                            f"{fields['heading_sd_deg']:.2f} deg  "
+                            f"n={fields['n_samples']}  (rotation centre)\n")
+                    pending = None
 
                 # periodic row
                 if now >= next_row:
@@ -440,7 +515,7 @@ def cmd_log(args):
                     warn = ("  STALE: " + ",".join(stale)) if stale else ""
                     sys.stdout.write(
                         f"\r  {now-t0:7.1f}s  {q:<11} sats {g.get('nsat','--'):>2}  "
-                        f"hdg {att.data.get('heading_deg') or 0:7.2f}  "
+                        f"hdg {true_heading(att.data.get('heading_deg')) or 0:7.2f}  "
                         f"spd {c.get('speed','-'):>5} mm/s  "
                         f"rows {rows:>6}  marks {len(marks):>3}{warn}   ")
                     sys.stdout.flush()
@@ -456,6 +531,11 @@ def cmd_log(args):
 
     total = time.monotonic() - t0
     summary = {
+        "format": MARK_FORMAT,
+        "heading_ref": "true",
+        "antenna_offset_m": ANTENNA_OFFSET_M,
+        "heading_offset_deg": HEADING_OFFSET_DEG,
+        "marks_rejected": rejected,
         "started_utc": stamp,
         "duration_s": round(total, 1),
         "rows": rows,
@@ -468,7 +548,8 @@ def cmd_log(args):
         json.dump(summary, f, indent=2)
 
     print(f"\n\n  {rows} rows over {total:.0f} s -> {csv_path}")
-    print(f"  {len(marks)} marks -> {json_path}")
+    print(f"  {len(marks)} marks -> {json_path}"
+          + (f"   ({rejected} refused)" if rejected else ""))
     if fix_counts:
         tot = sum(fix_counts.values())
         parts = [f"{k} {100*v/tot:.0f}%" for k, v in sorted(fix_counts.items())]

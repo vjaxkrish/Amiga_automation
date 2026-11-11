@@ -20,7 +20,8 @@ look like a software bug.
 
 ## Re-measure, do not assume
 
-Every constant in `calibration.md` is a property of that machine and mast:
+Every constant in `calibration.md` is a property of that machine and mast.
+The two GNSS ones live in `vehicle.py`; the rest at the top of `amiga_nav.py`.
 
 - [ ] `ANTENNA_OFFSET_M` - `python3 amiga_nav.py calib-offset`, several times
 - [ ] `HEADING_OFFSET_DEG` - drive straight, compare heading to
