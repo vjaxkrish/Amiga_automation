@@ -186,6 +186,16 @@ a crop in post-processing would undo.
 
 ---
 
+## Post-turn fix, 1.5 cm deadband, yaw-test (12 Nov)
+
+After any final turn the controller averages 0.5 s of readings and creeps
+straight forward or back to fix along-row error over 1.5 cm, because
+pivoting on turf walks the machine backward ~0.28 m per radian. Steering
+corrects cross-track beyond 1.5 cm (was 3). Arrival uses the mean of the
+last 3 GPS readings. Row-line following exists but is off
+(`ROW_LINE_FOLLOW`): fragile with the measured weak left turns. Details and
+simulation results: `CHANGES-2026-11-12.md`.
+
 ## Known gaps
 
 - `follow` has had no field testing. Only `goto` and `mission` have driven.

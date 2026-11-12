@@ -72,6 +72,25 @@ field wiring stays as built.
 
 ---
 
+## Pivot slip: ~0.28 m backward per radian turned in place
+
+Measured 12 Nov 2026 on turf. Every in-place turn moved the rotation centre
+backward: plot_001 4.4 cm for ~9 deg, mark_5 43 cm for ~88 deg, mark_8 about
+9 cm for ~39 deg; a pendant pivot test moved it 12 and 35 cm for two ~95 deg
+turns. Not the antenna offset (the pivot test's turns fit +5 and -2 cm of
+offset error, inconsistent). This is why the controller arrives square on
+in-row legs and creeps to fix the along-row error after any final turn.
+
+## Turning while rolling: ~10-25% of the wheel rate
+
+Three `yaw-test`s on 12 Nov 2026 at ~300 mm/s, the last with
+`rover_log.py drive` alongside to capture the wheel rate (0x18E): the wheels
+reach the commanded rate in ~1 s and wind down over ~1 s, but GPS heading
+turned at only ~10-25% of it, about the same left and right. Jerky
+(stick-slip: one turn stalled ~2.4 s mid-way). At 600 mrad/s the inside
+wheels stop and it pivots. `ANGULAR_MIN_ROLLING_MRAD_S` stays 220: smaller
+commands do almost nothing.
+
 ## ANGULAR_MIN_MRAD_S = 200
 
 Below roughly 150-200 mrad/s the machine does not rotate at all on turf.

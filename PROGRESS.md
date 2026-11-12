@@ -1,6 +1,6 @@
 # Progress
 
-Status as of **11 Nov 2026**. Platform: farm-ng Amiga, College Station,
+Status as of **12 Nov 2026**. Platform: farm-ng Amiga, College Station,
 secondary machine with a secondary Pi 5.
 
 **Where it stands:** the Amiga drives itself to RTK waypoints and stops on
@@ -22,7 +22,7 @@ itself.
 | 5 | **Log while driving manually.** RTK, heading, wheel speed, one clock | **DONE 27 Oct** - `rover_log.py` |
 | 6 | **Close the loop.** Point-to-point, then a multi-waypoint mission | **DONE 27 Oct** - `goto` and a 4-waypoint `mission` |
 | 7 | **GPS error handling.** Shared geometry, averaged marks, hold on fix loss, per-plot heading | **DONE 11 Nov in simulation** - not yet driven |
-| 8 | **Teach-and-repeat serpentine with ground truth.** 2 rows, headland turn, tape at every plot | **in progress 11 Nov** |
+| 8 | **Teach-and-repeat serpentine with ground truth.** 2 rows, headland turn, tape at every plot | **first run 12 Nov**; retuned, re-run pending |
 | 9 | **Capture integration.** Camera trigger in the `mission` hook, flag and continue | not started |
 | 10 | **Dallas.** Fixed base survey, re-measure constants, reproduce | not started |
 
@@ -55,6 +55,14 @@ Everything in this list was observed, not inferred.
 - **No wheel position on the bus.** The motor controllers broadcast and store
   per-wheel velocity only, with no position register (`can_sdo.py`, Nov).
   Position comes from RTK
+- **Turning in place on turf walks the machine backward ~0.28 m per
+  radian** (12 Nov: mission turns and a pendant pivot test). The antenna
+  offset is not the cause. Avoid final turns at plots
+- **On turf the wheels follow turn commands but only ~10-25% of it becomes
+  rotation at ~300 mm/s**, about the same left and right, jerky; ~1 s ramp
+  in and out (12 Nov yaw-tests, wheel rate from 0x18E vs GPS)
+- **GPS hold and resume works in the field** (12 Nov: corrections 5.1 s old
+  at the far headland, held 2.4 s, carried on)
 - **Survey-in:** 5 min converges to about 1 m absolute (1.241 m on 11 Nov).
   Irrelevant within a session, a frame shift between sessions
 
@@ -149,3 +157,16 @@ instead of ending the run; each mark squares to its taught heading;
 `rtcm_forward`, so nothing is stopped to teach. 21 tests pass on the rover Pi.
 Base survey-in converged to 1.241 m in 300 s. First ground-truth serpentine
 test started that evening.
+
+**12 Nov 2026** - First teach-and-repeat serpentine (2 rows, 4 plots, 2
+headland points): mission completed unattended, one GPS hold at the far
+headland (corrections 5.1 s old) recovered by itself. Plots 2-4 at 2.8 cm
+(GPS-reported), plot_001 7.1 cm after a 9 deg final turn. Found that turning
+in place on turf walks the machine backward ~0.28 m per radian (pivot test
+confirms it is physical, not the antenna offset), and that the 220 mrad/s
+yaw-test with the logger alongside: the wheels follow turn commands but on
+turf only ~10-25% becomes rotation, either way. Controller retuned
+against a simulator calibrated on that day's route: 1.5 cm deadband,
+post-turn creep fix, smoothed stopping, `yaw-test` added; row-line
+following built but left off (needs turning authority it lacks).
+`CHANGES-2026-11-12.md`.
