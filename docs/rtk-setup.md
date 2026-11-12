@@ -51,9 +51,11 @@ each get a fraction of the bytes and both starve, which looks exactly like a
 dead link.
 
 It republishes position, heading, fix quality and correction age to
-`/dev/shm/rover_state.json` at 10 Hz, written atomically. `amiga_nav.py`
-reads that file and never touches the ports; it falls back to opening them
-directly if the service is not running.
+`/dev/shm/rover_state.json` at 10 Hz, written atomically, with a counter per
+GGA and per PQTMTAR so readers can tell a new reading from a repeated one.
+`amiga_nav.py` and `rover_log.py` both read that file and never touch the
+ports while the service runs; each falls back to opening them directly only
+if it is not running. There is nothing to stop before teaching.
 
 Health check:
 

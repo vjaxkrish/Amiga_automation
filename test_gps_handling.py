@@ -579,6 +579,10 @@ class TeachLoop(unittest.TestCase):
             return ([r[0]] if ready else [], [], [])
 
         tmp = tempfile.mkdtemp()
+        saved_state = rover_log.STATE_PATH
+        # no forwarder: this test exercises the direct-ports fallback, even
+        # on the rover Pi where the real service is running
+        rover_log.STATE_PATH = os.path.join(tmp, "no_forwarder.json")
         saved = (rover_log.serial, rover_log.open_can, rover_log.termios,
                  rover_log.tty, rover_log.select, rover_log.find_port,
                  rover_log.OUT_DIR, rover_log.sys.stdin)
@@ -601,8 +605,10 @@ class TeachLoop(unittest.TestCase):
             (rover_log.serial, rover_log.open_can, rover_log.termios,
              rover_log.tty, rover_log.select, rover_log.find_port,
              rover_log.OUT_DIR, rover_log.sys.stdin) = saved
+            rover_log.STATE_PATH = saved_state
 
         self.assertEqual(rc, 0)
+        self.assertIn("via the ports directly", out.getvalue())
         js = [f for f in os.listdir(tmp) if f.endswith(".json")][0]
         with open(os.path.join(tmp, js)) as fh:
             summary = json.load(fh)
@@ -615,6 +621,157 @@ class TeachLoop(unittest.TestCase):
         x, y = frame.to_xy(m["lat"], m["lon"])
         self.assertLess(math.hypot(x - 1.5, y - 2.5), 0.01)
         self.assertAlmostEqual(m["heading"], 47.0, delta=0.2)
+
+
+# ============================================================================
+#  6. rover_log reading through rtcm_forward - nothing to stop or start
+# ============================================================================
+
+class _StateWriter:
+    """Plays rtcm_forward: rewrites a state file at 10 Hz GGA + 10 Hz TAR,
+    i.e. 20 file writes a second, each GGA value appearing in two files."""
+
+    def __init__(self, path, world):
+        import threading
+        self.path, self.world = path, world
+        self.stop = threading.Event()
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.gga_n = self.tar_n = 0
+        self.rtcm = 0
+
+    def run(self):
+        import time as _t
+        g = None
+        while not self.stop.is_set():
+            lat, lon, raw, fix = self.world()
+            self.gga_n += 1
+            g = {"lat": lat, "lon": lon, "fix_q": str(fix), "nsat": "28",
+                 "hdop": "0.6", "alt_m": "80.0", "corr_age_s": "1.5"}
+            for step in ("gga", "tar"):
+                if step == "tar":
+                    self.tar_n += 1
+                self.rtcm += 60
+                st = {"t_wall": _t.time(), **g, "heading_deg": raw,
+                      "pitch_deg": 0.5, "baseline_m": 1.3315, "head_q": "4",
+                      "rtcm_bytes": self.rtcm, "gga_n": self.gga_n,
+                      "tar_n": self.tar_n}
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(st, fh)
+                os.replace(tmp, self.path)
+                _t.sleep(0.05)
+
+    def __enter__(self):
+        self.t.start()
+        return self
+
+    def __exit__(self, *a):
+        self.stop.set()
+        self.t.join()
+
+
+class ForwarderMode(unittest.TestCase):
+
+    def test_feed_counts_each_reading_once(self):
+        import time as _t
+        frame = nav.Frame(LAT0, LON0)
+        tmp = tempfile.mkdtemp()
+        saved = rover_log.STATE_PATH
+        rover_log.STATE_PATH = os.path.join(tmp, "state.json")
+        w = _StateWriter(rover_log.STATE_PATH,
+                         lambda: (*antenna_reading(frame, 0, 0, 10.0), 4))
+        try:
+            with w:
+                _t.sleep(0.2)
+                feed, why = rover_log.open_feed()
+                self.assertIsNone(why)
+                self.assertEqual(feed.name, "rtcm_forward")
+                n0 = w.gga_n
+                got = 0
+                end = _t.monotonic() + 2.0
+                while _t.monotonic() < end:
+                    got += sum(1 for k, _, _ in feed.poll(_t.monotonic())
+                               if k == "gga")
+                    _t.sleep(0.005)
+                n1 = w.gga_n
+        finally:
+            rover_log.STATE_PATH = saved
+        # each distinct GGA seen once: ~20 in 2 s, never ~40
+        self.assertLessEqual(got, n1 - n0 + 1)
+        self.assertGreaterEqual(got, n1 - n0 - 2)
+
+    def test_teach_through_forwarder(self):
+        import time as _t
+        import types
+        frame = nav.Frame(LAT0, LON0)
+        rng = random.Random(5)
+        t0 = _t.monotonic()
+
+        def world():
+            la, lo, raw = antenna_reading(frame, -0.7, 3.1, 200.0, rng, 0.006)
+            return la, lo, raw, 4
+
+        keys = [(0.6, "n"), (4.4, "q")]
+
+        class Stdin:
+            def fileno(self):
+                return 0
+
+            def read(self, n):
+                return keys.pop(0)[1]
+
+        def fake_select(r, w, x, timeout=0):
+            ready = keys and _t.monotonic() - t0 >= keys[0][0]
+            return ([r[0]] if ready else [], [], [])
+
+        def no_ports(*a, **k):
+            raise AssertionError("opened a serial port while the forwarder "
+                                 "was running")
+
+        tmp = tempfile.mkdtemp()
+        saved = (rover_log.STATE_PATH, rover_log.serial, rover_log.open_can,
+                 rover_log.termios, rover_log.tty, rover_log.select,
+                 rover_log.OUT_DIR, rover_log.sys.stdin)
+        rover_log.STATE_PATH = os.path.join(tmp, "state.json")
+        rover_log.serial = types.SimpleNamespace(Serial=no_ports,
+                                                 SerialException=OSError)
+        rover_log.open_can = lambda: _FakeCan()
+        rover_log.termios = types.SimpleNamespace(
+            tcgetattr=lambda fd: None, tcsetattr=lambda *a: None, TCSADRAIN=1)
+        rover_log.tty = types.SimpleNamespace(setcbreak=lambda fd: None)
+        rover_log.select = types.SimpleNamespace(select=fake_select)
+        rover_log.OUT_DIR = tmp
+        rover_log.sys.stdin = Stdin()
+        out = io.StringIO()
+        try:
+            with _StateWriter(rover_log.STATE_PATH, world):
+                _t.sleep(0.2)
+                with redirect_stdout(out):
+                    rc = rover_log.cmd_log(argparse.Namespace(command="drive"))
+        finally:
+            (rover_log.STATE_PATH, rover_log.serial, rover_log.open_can,
+             rover_log.termios, rover_log.tty, rover_log.select,
+             rover_log.OUT_DIR, rover_log.sys.stdin) = saved
+
+        self.assertEqual(rc, 0)
+        self.assertIn("GNSS via rtcm_forward", out.getvalue())
+        js = [f for f in os.listdir(tmp)
+              if f.startswith("rover_") and f.endswith(".json")][0]
+        with open(os.path.join(tmp, js)) as fh:
+            summary = json.load(fh)
+        self.assertEqual(summary["gnss_source"], "rtcm_forward")
+        self.assertGreater(summary["rtcm_bytes"], 0)
+        self.assertEqual(len(summary["marks"]), 1)
+        m0 = summary["marks"][0]
+        self.assertEqual(m0["label"], "plot_001")
+        # 3 s at 10 Hz: about 30 distinct readings, not 60
+        self.assertLessEqual(m0["n_samples"], 34)
+        self.assertGreaterEqual(m0["n_samples"], 20)
+        with redirect_stdout(io.StringIO()):
+            m = nav.load_marks_json(os.path.join(tmp, js))[0]
+        x, y = frame.to_xy(m["lat"], m["lon"])
+        self.assertLess(math.hypot(x + 0.7, y - 3.1), 0.01)
+        self.assertAlmostEqual(m["heading"], 200.0, delta=0.2)
 
 
 if __name__ == "__main__":

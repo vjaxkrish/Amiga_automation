@@ -10,8 +10,10 @@ This runs as a service and nothing else forwards.
     python3 rtcm_forward.py           run in the foreground
     python3 rtcm_forward.py --status  one-shot: is it running, is it fixed
 
-Installed as a systemd unit, this is the only process that opens the radio.
-rover_log.py and amiga_nav.py read the receiver but leave forwarding alone.
+Installed as a systemd unit, this is the only process that opens the radio
+or the receiver. rover_log.py and amiga_nav.py read /dev/shm/rover_state.json
+while it is running, so it never has to be stopped. Each fall back to opening
+the ports themselves only when it is not running.
 """
 
 import argparse
@@ -107,6 +109,11 @@ def run():
     lat = lon = alt = None
     heading = pitch = baseline = None
     head_q = ""
+    # Counters, so a reader can tell a NEW reading from the same one
+    # republished: the file is rewritten on every GGA and every PQTMTAR, so
+    # a GGA value appears in several consecutive files. rover_log averages
+    # marks over distinct readings and needs to know which are new.
+    gga_n = tar_n = 0
     last_report = time.monotonic()
     last_fix = None
     buf = b""
@@ -160,6 +167,7 @@ def run():
                         fix_q, nsat, hdop = f[6], f[7], f[8]
                         alt = f[9]
                         age = f[13] if len(f) > 13 else ""
+                        gga_n += 1
                         fresh = True
                 elif sline.startswith("$PQTMTAR") and len(f) > 12:
                     def num(i):
@@ -171,6 +179,7 @@ def run():
                     baseline = num(5)
                     pitch = num(6)
                     heading = num(8)
+                    tar_n += 1
                     fresh = True
 
             if fresh:
@@ -182,6 +191,7 @@ def run():
                     "heading_deg": heading, "pitch_deg": pitch,
                     "baseline_m": baseline, "head_q": head_q,
                     "rtcm_bytes": total,
+                    "gga_n": gga_n, "tar_n": tar_n,
                 })
 
             now = time.monotonic()

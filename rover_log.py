@@ -3,8 +3,13 @@
 rover_log.py - Phase 0 step 5. Log everything the controller will need.
 
 Runs on the rover Pi with radio B, the LG580P and the CAN adapter attached.
-Forwards RTCM from the radio into the receiver, reads position, heading and
-wheel speed, and writes one CSV with a single time base.
+Reads position, heading and wheel speed and writes one CSV with a single
+time base.
+
+GNSS comes from rtcm_forward.service when it is running (the normal case):
+the service keeps forwarding corrections and this reads its state file, so
+there is nothing to stop or start. Only if the service is NOT running does
+this open the radio and receiver itself and forward RTCM on its own.
 
     python3 rover_log.py drive              log a manual driving run
     python3 rover_log.py teach              same, but 'm' marks a waypoint
@@ -210,6 +215,135 @@ class Source:
         return None if self.t is None else now - self.t
 
 
+class ForwarderFeed:
+    """GNSS readings from rtcm_forward.service, via its state file.
+
+    The forwarder owns the radio and the receiver and keeps corrections
+    flowing whether or not anything else is running, so the RTK fix
+    survives between programs. Reading its file instead of the ports means
+    the service never has to be stopped for logging or teaching."""
+
+    name = "rtcm_forward"
+    POLL_S = 0.02
+
+    def __init__(self):
+        self.next_poll = 0.0
+        self.last_gga_n = None
+        self.last_tar_n = None
+        self.last_gga_key = None
+        self.rtcm0 = None
+        self.rtcm_bytes = 0
+
+    def close(self):
+        pass
+
+    def poll(self, now):
+        """Return a list of ('gga'|'tar', dict, age_s) for readings that are
+        NEW since the last poll."""
+        if now < self.next_poll:
+            return []
+        self.next_poll = now + self.POLL_S
+        st = read_state()
+        if st is None:
+            return []
+        age = max(0.0, time.time() - st["t_wall"])
+        rb = st.get("rtcm_bytes") or 0
+        if self.rtcm0 is None:
+            self.rtcm0 = rb
+        self.rtcm_bytes = rb - self.rtcm0
+        out = []
+
+        gga = {"lat": st.get("lat"), "lon": st.get("lon"),
+               "fix_q": str(st.get("fix_q", "")), "nsat": st.get("nsat", ""),
+               "hdop": st.get("hdop", ""), "alt_m": st.get("alt_m", ""),
+               "corr_age_s": st.get("corr_age_s", "")}
+        n = st.get("gga_n")
+        if n is not None:
+            new = n != self.last_gga_n
+            self.last_gga_n = n
+        else:
+            # older forwarder without counters: a change in any field
+            key = tuple(gga.values())
+            new = key != self.last_gga_key
+            self.last_gga_key = key
+        if new and gga["lat"] is not None:
+            out.append(("gga", gga, age))
+
+        n = st.get("tar_n")
+        if n is None or n != self.last_tar_n:
+            self.last_tar_n = n
+            if st.get("heading_deg") is not None:
+                out.append(("tar", {"head_q": st.get("head_q", ""),
+                                    "baseline_m": st.get("baseline_m"),
+                                    "pitch_deg": st.get("pitch_deg"),
+                                    "heading_deg": st.get("heading_deg"),
+                                    "head_nsat": ""}, age))
+        return out
+
+
+class PortFeed:
+    """GNSS readings straight from the ports, forwarding RTCM itself. Only
+    used when rtcm_forward is NOT running - two readers on one serial port
+    each get a fraction of the bytes and both starve."""
+
+    name = "ports"
+
+    def __init__(self, lg_port, radio_port):
+        self.lg = serial.Serial(lg_port, LG580P_BAUD, timeout=0)
+        self.rad = serial.Serial(radio_port, RADIO_BAUD, timeout=0)
+        self.buf = b""
+        self.rtcm_bytes = 0
+
+    def close(self):
+        for h in (self.lg, self.rad):
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    def poll(self, now):
+        out = []
+        air = self.rad.read(2048)
+        if air:
+            self.lg.write(air)
+            self.rtcm_bytes += len(air)
+        self.buf += self.lg.read(4096)
+        if len(self.buf) > 65536:
+            self.buf = self.buf[-4096:]
+        while b"\n" in self.buf:
+            raw, self.buf = self.buf.split(b"\n", 1)
+            s = raw.decode("ascii", "ignore").strip()
+            if not nmea_ok(s):
+                continue
+            f = s.split(",")
+            if s.startswith("$GNGGA"):
+                d = parse_gga(f)
+                if d:
+                    out.append(("gga", d, 0.0))
+            elif s.startswith("$PQTMTAR"):
+                d = parse_tar(f)
+                if d:
+                    out.append(("tar", d, 0.0))
+        return out
+
+
+def open_feed():
+    """The forwarder's file if it is running, else the ports. Returns
+    (feed, None) or (None, reason)."""
+    if read_state() is not None:
+        return ForwarderFeed(), None
+    lg = find_port(LG580P_FRAG)
+    radio = find_port(RADIO_FRAG)
+    if not lg or not radio:
+        return None, (f"rtcm_forward is not running and the ports are missing "
+                      f"(LG580P {lg or 'NOT FOUND'}, radio B "
+                      f"{radio or 'NOT FOUND'})")
+    try:
+        return PortFeed(lg, radio), None
+    except (serial.SerialException, OSError) as e:
+        return None, f"cannot open the GNSS ports: {e}"
+
+
 def open_can():
     s = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
     s.bind((CAN_IFACE,))
@@ -256,10 +390,13 @@ def parse_tar(f):
 # --- commands ---------------------------------------------------------------
 
 def cmd_check(args):
-    lg = find_port(LG580P_FRAG)
-    radio = find_port(RADIO_FRAG)
-    print(f"LG580P  {lg or 'NOT FOUND'}")
-    print(f"radio B {radio or 'NOT FOUND'}")
+    feed, why = open_feed()
+    if feed is None:
+        print(f"GNSS    {why}")
+    else:
+        print(f"GNSS    via {feed.name}"
+              + ("" if feed.name == "rtcm_forward"
+                 else "  (rtcm_forward not running - opening the ports)"))
     try:
         sock = open_can()
         print(f"CAN     {CAN_IFACE} open")
@@ -267,35 +404,20 @@ def cmd_check(args):
         print(f"CAN     {CAN_IFACE} FAILED: {e}")
         sock = None
 
-    if not (lg and radio and sock):
+    if not (feed and sock):
         print("\nnot all sources present")
         return 1
 
     print("\nsampling 5 s ...")
-    seen = {"gga": 0, "tar": 0, "can": 0, "rtcm_bytes": 0}
+    seen = {"gga": 0, "tar": 0, "can": 0}
     fix = "-"
-    with serial.Serial(lg, LG580P_BAUD, timeout=0.05) as lgs, \
-         serial.Serial(radio, RADIO_BAUD, timeout=0.05) as rad:
-        buf = b""
+    try:
         end = time.monotonic() + 5
         while time.monotonic() < end:
-            air = rad.read(1024)
-            if air:
-                lgs.write(air)
-                seen["rtcm_bytes"] += len(air)
-            buf += lgs.read(2048)
-            while b"\n" in buf:
-                raw, buf = buf.split(b"\n", 1)
-                s = raw.decode("ascii", "ignore").strip()
-                if not nmea_ok(s):
-                    continue
-                if s.startswith("$GNGGA"):
-                    seen["gga"] += 1
-                    g = parse_gga(s.split(","))
-                    if g:
-                        fix = FIX_LABEL.get(g["fix_q"], g["fix_q"])
-                elif s.startswith("$PQTMTAR"):
-                    seen["tar"] += 1
+            for kind, d, _ in feed.poll(time.monotonic()):
+                seen[kind] += 1
+                if kind == "gga":
+                    fix = FIX_LABEL.get(d["fix_q"], d["fix_q"])
             while True:
                 try:
                     raw = sock.recv(16)
@@ -304,16 +426,20 @@ def cmd_check(args):
                 cid, dlc, data = CAN_FRAME.unpack(raw)
                 if (cid & 0x1FFFFFFF) == COBID_TPDO1:
                     seen["can"] += 1
+            time.sleep(0.005)
+    finally:
+        feed.close()
+        sock.close()
 
     print(f"  GGA      {seen['gga']:>5}   fix: {fix}")
     print(f"  PQTMTAR  {seen['tar']:>5}")
     print(f"  0x18E    {seen['can']:>5}")
-    print(f"  RTCM in  {seen['rtcm_bytes']:>5} B")
+    print(f"  RTCM in  {feed.rtcm_bytes:>5} B")
     missing = [k for k in ("gga", "tar", "can") if seen[k] == 0]
     if missing:
         print(f"\nNO DATA FROM: {', '.join(missing)}")
         return 1
-    if seen["rtcm_bytes"] == 0:
+    if feed.rtcm_bytes == 0:
         print("\nno RTCM arriving - is the base running?")
     print("\nall sources alive")
     return 0
@@ -321,14 +447,14 @@ def cmd_check(args):
 
 def cmd_log(args):
     teach = args.command == "teach"
-    lg_port = find_port(LG580P_FRAG)
-    radio_port = find_port(RADIO_FRAG)
-    if not lg_port or not radio_port:
-        print("missing LG580P or radio - run 'check'")
+    feed, why = open_feed()
+    if feed is None:
+        print(f"{why} - run 'check'")
         return 1
     try:
         sock = open_can()
     except OSError as e:
+        feed.close()
         print(f"cannot open {CAN_IFACE}: {e}")
         return 1
 
@@ -346,11 +472,14 @@ def cmd_log(args):
     rejected = 0
     plot_id = 1
     rows = 0
-    rtcm_bytes = 0
     fix_counts = {}
     t0 = time.monotonic()
 
     print(f"logging to {csv_path}")
+    if feed.name == "rtcm_forward":
+        print("  GNSS via rtcm_forward (the service keeps forwarding corrections)")
+    else:
+        print("  GNSS via the ports directly - rtcm_forward is not running")
     print("  m = mark    n = mark as next plot id    q = stop\n")
 
     fd = sys.stdin.fileno()
@@ -395,132 +524,112 @@ def cmd_log(args):
 
     try:
         tty.setcbreak(fd)
-        with serial.Serial(lg_port, LG580P_BAUD, timeout=0) as lgs, \
-             serial.Serial(radio_port, RADIO_BAUD, timeout=0) as rad:
+        period = 1.0 / LOG_RATE_HZ
+        next_row = time.monotonic()
+        next_status = time.monotonic() + 1.0
 
-            lg_buf = b""
-            period = 1.0 / LOG_RATE_HZ
-            next_row = time.monotonic()
-            next_status = time.monotonic() + 1.0
+        while True:
+            now = time.monotonic()
 
-            while True:
-                now = time.monotonic()
-
-                # radio -> receiver
-                air = rad.read(2048)
-                if air:
-                    lgs.write(air)
-                    rtcm_bytes += len(air)
-
-                # receiver -> parse
-                lg_buf += lgs.read(4096)
-                while b"\n" in lg_buf:
-                    raw, lg_buf = lg_buf.split(b"\n", 1)
-                    s = raw.decode("ascii", "ignore").strip()
-                    if not nmea_ok(s):
-                        continue
-                    f = s.split(",")
-                    if s.startswith("$GNGGA"):
-                        d = parse_gga(f)
-                        if d:
-                            gps.update(d, now)
-                            if pending is not None:
-                                pending["gga"].append(d)
-                            q = FIX_LABEL.get(d["fix_q"], d["fix_q"])
-                            fix_counts[q] = fix_counts.get(q, 0) + 1
-                    elif s.startswith("$PQTMTAR"):
-                        d = parse_tar(f)
-                        if d:
-                            att.update(d, now)
-                            if pending is not None:
-                                pending["hdg"].append(d.get("heading_deg"))
-
-                # CAN
-                while True:
-                    try:
-                        raw = sock.recv(16)
-                    except (BlockingIOError, OSError):
-                        break
-                    cid, dlc, data = CAN_FRAME.unpack(raw)
-                    if (cid & 0x1FFFFFFF) != COBID_TPDO1 or dlc < 8:
-                        continue
-                    st, sp, ang = struct.unpack_from("<Bhh", data)
-                    can.update({"state": st, "speed": sp, "angular": ang,
-                                "soc": data[7]}, now)
+            # GNSS: only readings that are new since the last poll
+            for kind, d, age in feed.poll(now):
+                if kind == "gga":
+                    gps.update(d, now - age)
                     if pending is not None:
-                        pending["spd"].append(sp)
+                        pending["gga"].append(d)
+                    q = FIX_LABEL.get(d["fix_q"], d["fix_q"])
+                    fix_counts[q] = fix_counts.get(q, 0) + 1
+                else:
+                    att.update(d, now - age)
+                    if pending is not None:
+                        pending["hdg"].append(d.get("heading_deg"))
 
-                # keyboard
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    c = sys.stdin.read(1).lower()
-                    if c == "q":
-                        break
-                    if c in ("m", "n") and pending is None:
-                        numbered = teach or c == "n"
-                        label = (f"plot_{plot_id:03d}" if numbered
-                                 else f"mark_{len(marks)+1}")
-                        pending = {"label": label, "numbered": numbered,
-                                   "t_end": now + MARK_AVG_S,
-                                   "gga": [], "hdg": [], "spd": []}
-                        sys.stdout.write(f"\r  {label}: hold still, averaging "
-                                         f"{MARK_AVG_S:.0f} s ...{' ' * 40}\n")
+            # CAN
+            while True:
+                try:
+                    raw = sock.recv(16)
+                except (BlockingIOError, OSError):
+                    break
+                cid, dlc, data = CAN_FRAME.unpack(raw)
+                if (cid & 0x1FFFFFFF) != COBID_TPDO1 or dlc < 8:
+                    continue
+                st, sp, ang = struct.unpack_from("<Bhh", data)
+                can.update({"state": st, "speed": sp, "angular": ang,
+                            "soc": data[7]}, now)
+                if pending is not None:
+                    pending["spd"].append(sp)
 
-                # finish a mark once its averaging window has closed
-                if pending is not None and now >= pending["t_end"]:
-                    label = pending["label"]
-                    fields, why = average_mark(pending["gga"], pending["hdg"],
-                                               pending["spd"])
-                    if fields is None:
-                        rejected += 1
-                        snapshot(now, "mark_rejected", label)
-                        rows += 1
-                        sys.stdout.write(
-                            f"\r  REFUSED {label}: {why}. "
-                            f"Not saved - press m to try again.\a\n")
-                    else:
-                        v = snapshot(now, "mark", label)
-                        rows += 1
-                        mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"],
-                                "label": label}
-                        mark.update(fields)
-                        marks.append(mark)
-                        if pending["numbered"]:
-                            plot_id += 1
-                        sys.stdout.write(
-                            f"\r  MARK {label}  {fields['lat']:.9f},"
-                            f"{fields['lon']:.9f}  hdg {fields['heading_deg']:.1f}"
-                            f"  sd {fields['pos_sd_cm']:.1f} cm / "
-                            f"{fields['heading_sd_deg']:.2f} deg  "
-                            f"n={fields['n_samples']}  (rotation centre)\n")
-                    pending = None
+            # keyboard
+            if select.select([sys.stdin], [], [], 0)[0]:
+                c = sys.stdin.read(1).lower()
+                if c == "q":
+                    break
+                if c in ("m", "n") and pending is None:
+                    numbered = teach or c == "n"
+                    label = (f"plot_{plot_id:03d}" if numbered
+                             else f"mark_{len(marks)+1}")
+                    pending = {"label": label, "numbered": numbered,
+                               "t_end": now + MARK_AVG_S,
+                               "gga": [], "hdg": [], "spd": []}
+                    sys.stdout.write(f"\r  {label}: hold still, averaging "
+                                     f"{MARK_AVG_S:.0f} s ...{' ' * 40}\n")
 
-                # periodic row
-                if now >= next_row:
-                    snapshot(now)
+            # finish a mark once its averaging window has closed
+            if pending is not None and now >= pending["t_end"]:
+                label = pending["label"]
+                fields, why = average_mark(pending["gga"], pending["hdg"],
+                                           pending["spd"])
+                if fields is None:
+                    rejected += 1
+                    snapshot(now, "mark_rejected", label)
                     rows += 1
-                    next_row += period
-                    if next_row < now:
-                        next_row = now + period
-
-                # status line
-                if now >= next_status:
-                    next_status = now + 1.0
-                    g, c = gps.data, can.data
-                    q = FIX_LABEL.get(g.get("fix_q", ""), "-")
-                    stale = []
-                    for nm, src in (("gps", gps), ("att", att), ("can", can)):
-                        a = src.age(now)
-                        if a is None or a > STALE_WARN_S:
-                            stale.append(nm)
-                    warn = ("  STALE: " + ",".join(stale)) if stale else ""
                     sys.stdout.write(
-                        f"\r  {now-t0:7.1f}s  {q:<11} sats {g.get('nsat','--'):>2}  "
-                        f"hdg {true_heading(att.data.get('heading_deg')) or 0:7.2f}  "
-                        f"spd {c.get('speed','-'):>5} mm/s  "
-                        f"rows {rows:>6}  marks {len(marks):>3}{warn}   ")
-                    sys.stdout.flush()
+                        f"\r  REFUSED {label}: {why}. "
+                        f"Not saved - press m to try again.\a\n")
+                else:
+                    v = snapshot(now, "mark", label)
+                    rows += 1
+                    mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"],
+                            "label": label}
+                    mark.update(fields)
+                    marks.append(mark)
+                    if pending["numbered"]:
+                        plot_id += 1
+                    sys.stdout.write(
+                        f"\r  MARK {label}  {fields['lat']:.9f},"
+                        f"{fields['lon']:.9f}  hdg {fields['heading_deg']:.1f}"
+                        f"  sd {fields['pos_sd_cm']:.1f} cm / "
+                        f"{fields['heading_sd_deg']:.2f} deg  "
+                        f"n={fields['n_samples']}  (rotation centre)\n")
+                pending = None
 
-                time.sleep(0.002)
+            # periodic row
+            if now >= next_row:
+                snapshot(now)
+                rows += 1
+                next_row += period
+                if next_row < now:
+                    next_row = now + period
+
+            # status line
+            if now >= next_status:
+                next_status = now + 1.0
+                g, c = gps.data, can.data
+                q = FIX_LABEL.get(g.get("fix_q", ""), "-")
+                stale = []
+                for nm, src in (("gps", gps), ("att", att), ("can", can)):
+                    a = src.age(now)
+                    if a is None or a > STALE_WARN_S:
+                        stale.append(nm)
+                warn = ("  STALE: " + ",".join(stale)) if stale else ""
+                sys.stdout.write(
+                    f"\r  {now-t0:7.1f}s  {q:<11} sats {g.get('nsat','--'):>2}  "
+                    f"hdg {true_heading(att.data.get('heading_deg')) or 0:7.2f}  "
+                    f"spd {c.get('speed','-'):>5} mm/s  "
+                    f"rows {rows:>6}  marks {len(marks):>3}{warn}   ")
+                sys.stdout.flush()
+
+            time.sleep(0.002)
 
     except KeyboardInterrupt:
         pass
@@ -528,6 +637,7 @@ def cmd_log(args):
         termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         csv.close()
         sock.close()
+        feed.close()
 
     total = time.monotonic() - t0
     summary = {
@@ -539,7 +649,8 @@ def cmd_log(args):
         "started_utc": stamp,
         "duration_s": round(total, 1),
         "rows": rows,
-        "rtcm_bytes": rtcm_bytes,
+        "rtcm_bytes": feed.rtcm_bytes,
+        "gnss_source": feed.name,
         "fix_quality_counts": fix_counts,
         "marks": marks,
         "csv": csv_path,

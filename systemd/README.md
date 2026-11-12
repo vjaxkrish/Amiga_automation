@@ -14,15 +14,16 @@ Add `--fixed` to ExecStart once a site position has been surveyed and
 `rtcm-forward.service` -> `rtcm_forward.py`
 
 **This is the only process allowed to open the radio or the receiver.**
-`rover_log.py` still opens them directly, so stop this service before
-logging or teaching:
+Leave it running. `rover_log.py` and `amiga_nav.py` both detect it and read
+`/dev/shm/rover_state.json` instead of the ports; each opens the ports
+itself only when the service is not running.
 
-    sudo systemctl stop rtcm-forward
-    python3 rover_log.py teach
-    sudo systemctl start rtcm-forward
+After copying a new `rtcm_forward.py` to the Pi:
 
-`amiga_nav.py` does not need this - it detects the service and reads
-`/dev/shm/rover_state.json` instead.
+    sudo systemctl restart rtcm-forward
+
+The fix survives a restart: the receiver holds RTK for about a minute
+without corrections, and the restart takes a second or two.
 
 ## Install
 

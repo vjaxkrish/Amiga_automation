@@ -124,11 +124,11 @@ usually nothing is forwarding. Check the service is actually up.
 
 ## 3. Teach waypoints
 
-**Stop the forwarder first.** `rover_log.py` still opens both serial ports
-directly and will fight the service.
+Leave the forwarder running. `rover_log.py` reads position and heading from
+it (`GNSS via rtcm_forward` in its first lines), so the fix is never
+interrupted. It opens the ports itself only if the service is not running.
 
 ```bash
-sudo systemctl stop rtcm-forward
 python3 rover_log.py check
 ```
 
@@ -159,11 +159,6 @@ the same way would make the machine spin in place at every plot of the
 reversed rows. Marks are stored as the **rotation centre**, which is what
 `amiga_nav` drives to.
 
-Restart the forwarder when done:
-
-```bash
-sudo systemctl start rtcm-forward
-```
 
 ---
 
