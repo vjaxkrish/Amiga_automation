@@ -15,6 +15,9 @@ this open the radio and receiver itself and forward RTCM on its own.
     python3 rover_log.py teach              same, but 'm' marks a waypoint
     python3 rover_log.py check              one-shot: are all three sources alive
 
+    python3 teach_gui.py --map "2023 SA NTEP"   the same teach, with the plot
+            map on screen: plots turn green as they are marked
+
     python3 rover_log.py drive --cols 9 --start-row 1
             teach with plot-map names: plots are labelled R{row}_C{col}
             in the order they are driven - along map rows, serpentine:
@@ -28,7 +31,7 @@ While running:
             the next R{row}_C{col})
     s       with --cols: skip the next plot name without marking (a plot
             that is missing or cannot be reached)
-    u       undo the last mark (a plot's name is handed back)
+    u       undo the last mark or skip (plot names go back to where they were)
     q       stop and write the summary
 
 A mark is not one reading. Pressing m starts a 3 s average with the machine
@@ -59,7 +62,10 @@ import time
 import tty
 from datetime import datetime, timezone
 
-import serial
+try:
+    import serial
+except ImportError:          # a laptop without pyserial: teach_gui --demo
+    serial = None
 
 from vehicle import (ANTENNA_OFFSET_M, HEADING_OFFSET_DEG, true_heading,
                      rotation_centre, circular_mean_deg, metres_between)
@@ -349,6 +355,8 @@ def open_feed():
         return None, (f"rtcm_forward is not running and the ports are missing "
                       f"(LG580P {lg or 'NOT FOUND'}, radio B "
                       f"{radio or 'NOT FOUND'})")
+    if serial is None:
+        return None, "pyserial is not installed (pip install pyserial)"
     try:
         return PortFeed(lg, radio), None
     except (serial.SerialException, OSError) as e:
@@ -489,61 +497,192 @@ class PlotLabeler:
         self.k = max(0, self.k - 1)
 
 
-def cmd_log(args):
-    teach = args.command == "teach"
-    feed, why = open_feed()
-    if feed is None:
-        print(f"{why} - run 'check'")
-        return 1
-    try:
-        sock = open_can()
-    except OSError as e:
-        feed.close()
-        print(f"cannot open {CAN_IFACE}: {e}")
-        return 1
+class TeachSession:
+    """One teach (or drive-log) session, with no screen or keyboard of its
+    own. rover_log.py (terminal) and teach_gui.py (window) both drive this
+    class, so there is exactly one copy of how a mark is taken, named,
+    refused, undone and saved.
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(OUT_DIR, f"rover_{stamp}.csv")
-    json_path = os.path.join(OUT_DIR, f"rover_{stamp}.json")
+        s = TeachSession(feed, can_sock, cols=9, start_row=1)
+        loop:  events = s.poll(time.monotonic())     # every few ms
+        keys:  s.mark("plot") / s.mark("headland") / s.skip() / s.undo()
+        end:   s.close()                              # writes the .json
 
-    gps = Source()
-    att = Source()
-    can = Source()
+    poll() returns a list of (kind, text, data) events for the caller to
+    show: kind is mark | refused | averaging | skip | undo | info.
 
-    marks = []
-    pending = None             # a mark being averaged: label, t_end, samples
-    rejected = 0
-    grid = bool(getattr(args, "cols", None))
-    labeler = PlotLabeler(getattr(args, "cols", None),
-                          getattr(args, "start_row", 1) or 1)
-    rows = 0
-    fix_counts = {}
-    t0 = time.monotonic()
+    The summary .json is rewritten after every mark, skip and undo, so a
+    crash or a flat battery mid-teach loses nothing already marked."""
 
-    print(f"logging to {csv_path}")
-    if grid:
-        print(f"  plot names from the map grid, {args.cols} columns, starting "
-              f"at row {labeler.start_row}: first plot is {labeler.current()}")
-        print("  n = plot   m = headland point   s = skip a plot   "
-              "u = undo   q = save")
-    if feed.name == "rtcm_forward":
-        print("  GNSS via rtcm_forward (the service keeps forwarding corrections)")
-    else:
-        print("  GNSS via the ports directly - rtcm_forward is not running")
-    print("  m = mark    n = mark as next plot id    q = stop\n")
+    def __init__(self, feed, sock, cols=None, start_row=1, teach=True,
+                 out_dir=None, stamp=None):
+        self.feed, self.sock = feed, sock
+        self.teach = teach
+        self.grid = bool(cols)
+        self.labeler = PlotLabeler(cols, start_row or 1)
+        self.out_dir = out_dir or OUT_DIR
+        os.makedirs(self.out_dir, exist_ok=True)
+        self.stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.csv_path = os.path.join(self.out_dir, f"rover_{self.stamp}.csv")
+        self.json_path = os.path.join(self.out_dir, f"rover_{self.stamp}.json")
+        self.gps, self.att, self.can = Source(), Source(), Source()
+        self.marks = []
+        self.skipped = []          # plot names skipped, in order
+        self.history = []          # undo stack: (action, labeler.k before)
+        self.pending = None        # a mark being averaged
+        self.rejected = 0
+        self.rows = 0
+        self.fix_counts = {}
+        self.t0 = time.monotonic()
+        self.next_row = self.t0
+        self.period = 1.0 / LOG_RATE_HZ
+        self.csv = open(self.csv_path, "w", buffering=1)
+        self.csv.write(",".join(COLUMNS) + "\n")
+        self.closed = False
 
-    fd = sys.stdin.fileno()
-    old_term = termios.tcgetattr(fd)
-    csv = open(csv_path, "w", buffering=1)
-    csv.write(",".join(COLUMNS) + "\n")
+    # -- what the screen shows ------------------------------------------
+    def next_plot(self):
+        return self.labeler.current()
 
-    def snapshot(now, row_type="sample", label=""):
-        g, a, c = gps.data, att.data, can.data
+    def next_rc(self):
+        return self.labeler.rc() if self.grid else None
+
+    def status(self, now):
+        g, a, c = self.gps.data, self.att.data, self.can.data
+        stale = [nm for nm, src in (("gps", self.gps), ("heading", self.att),
+                                    ("can", self.can))
+                 if src.age(now) is None or src.age(now) > STALE_WARN_S]
+        return {
+            "fix": FIX_LABEL.get(g.get("fix_q", ""), "-"),
+            "fix_q": g.get("fix_q", ""),
+            "nsat": g.get("nsat", ""),
+            "corr_age_s": g.get("corr_age_s", ""),
+            "heading": true_heading(a.get("heading_deg")),
+            "speed": c.get("speed"),
+            "stale": stale,
+            "averaging": (self.pending["label"], self.pending["t_end"] - now)
+                         if self.pending else None,
+            "marks": len(self.marks),
+            "rows": self.rows,
+            "elapsed": now - self.t0,
+        }
+
+    # -- actions --------------------------------------------------------
+    def mark(self, kind, now=None):
+        """kind 'plot' (named R/C or plot_NNN) or 'headland' (mark_N, never
+        captured). In plain teach mode without a grid every mark is a plot,
+        as before."""
+        if self.pending is not None:
+            return None
+        now = time.monotonic() if now is None else now
+        numbered = kind == "plot" or (self.teach and not self.grid)
+        label = (self.labeler.current() if numbered
+                 else f"mark_{len(self.marks) + 1}")
+        self.pending = {"label": label, "numbered": numbered,
+                        "t_end": now + MARK_AVG_S,
+                        "gga": [], "hdg": [], "spd": []}
+        return label
+
+    def skip(self):
+        if self.pending is not None or not self.grid:
+            return None
+        name = self.labeler.current()
+        self.history.append(("skip", name, self.labeler.k))
+        self.skipped.append(name)
+        self.labeler.advance()
+        self.save()
+        return name
+
+    def undo(self, now=None):
+        """Undo the last mark OR skip. The plot names go back to exactly
+        where they were before it (a skip after the mark is undone first)."""
+        if self.pending is not None or not self.history:
+            return None
+        now = time.monotonic() if now is None else now
+        action, what, k_before = self.history.pop()
+        self.labeler.k = k_before
+        if action == "skip":
+            self.skipped.remove(what)
+        else:
+            gone = self.marks.pop()
+            self.snapshot(now, "mark_undone", gone["label"])
+            what = gone["label"]
+        self.save()
+        return action, what
+
+    # -- the loop ---------------------------------------------------------
+    def poll(self, now):
+        events = []
+        for kind, d, age in self.feed.poll(now):
+            if kind == "gga":
+                self.gps.update(d, now - age)
+                if self.pending is not None:
+                    self.pending["gga"].append(d)
+                q = FIX_LABEL.get(d["fix_q"], d["fix_q"])
+                self.fix_counts[q] = self.fix_counts.get(q, 0) + 1
+            else:
+                self.att.update(d, now - age)
+                if self.pending is not None:
+                    self.pending["hdg"].append(d.get("heading_deg"))
+
+        while True:
+            try:
+                raw = self.sock.recv(16)
+            except (BlockingIOError, OSError):
+                break
+            cid, dlc, data = CAN_FRAME.unpack(raw)
+            if (cid & 0x1FFFFFFF) != COBID_TPDO1 or dlc < 8:
+                continue
+            st, sp, ang = struct.unpack_from("<Bhh", data)
+            self.can.update({"state": st, "speed": sp, "angular": ang,
+                             "soc": data[7]}, now)
+            if self.pending is not None:
+                self.pending["spd"].append(sp)
+
+        if self.pending is not None and now >= self.pending["t_end"]:
+            events.append(self._finish_mark(now))
+
+        if now >= self.next_row:
+            self.snapshot(now)
+            self.next_row += self.period
+            if self.next_row < now:
+                self.next_row = now + self.period
+        return events
+
+    def _finish_mark(self, now):
+        p, self.pending = self.pending, None
+        label = p["label"]
+        fields, why = average_mark(p["gga"], p["hdg"], p["spd"])
+        if fields is None:
+            self.rejected += 1
+            self.snapshot(now, "mark_rejected", label)
+            return ("refused", f"REFUSED {label}: {why}. Not saved - "
+                               f"press the same key to try again.",
+                    {"label": label, "why": why})
+        v = self.snapshot(now, "mark", label)
+        mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"], "label": label,
+                "kind": "plot" if p["numbered"] else "headland"}
+        if self.grid and p["numbered"]:
+            mark["row"], mark["col"] = self.labeler.rc()
+        mark.update(fields)
+        self.history.append(("mark", label, self.labeler.k))
+        self.marks.append(mark)
+        if p["numbered"]:
+            self.labeler.advance()
+        self.save()
+        return ("mark",
+                f"MARK {label}  {fields['lat']:.9f},{fields['lon']:.9f}  "
+                f"hdg {fields['heading_deg']:.1f}  sd {fields['pos_sd_cm']:.1f}"
+                f" cm / {fields['heading_sd_deg']:.2f} deg  "
+                f"n={fields['n_samples']}  (rotation centre)", mark)
+
+    def snapshot(self, now, row_type="sample", label=""):
+        g, a, c = self.gps.data, self.att.data, self.can.data
         hdg_true = true_heading(a.get("heading_deg"))
         clat, clon = rotation_centre(g.get("lat"), g.get("lon"), hdg_true)
+        gage, tage, cage = self.gps.age(now), self.att.age(now), self.can.age(now)
         vals = {
-            "t_mono": f"{now - t0:.3f}",
+            "t_mono": f"{now - self.t0:.3f}",
             "t_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "row_type": row_type,
             "label": label,
@@ -556,189 +695,162 @@ def cmd_log(args):
             "nsat": g.get("nsat", ""),
             "hdop": g.get("hdop", ""),
             "corr_age_s": g.get("corr_age_s", ""),
-            "gga_age_s": f"{gps.age(now):.2f}" if gps.age(now) is not None else "",
+            "gga_age_s": f"{gage:.2f}" if gage is not None else "",
             "heading_deg": f"{a['heading_deg']:.4f}" if a.get("heading_deg") is not None else "",
             "heading_true_deg": f"{hdg_true:.4f}" if hdg_true is not None else "",
             "pitch_deg": f"{a['pitch_deg']:.4f}" if a.get("pitch_deg") is not None else "",
             "baseline_m": f"{a['baseline_m']:.4f}" if a.get("baseline_m") is not None else "",
             "head_q": a.get("head_q", ""),
             "head_nsat": a.get("head_nsat", ""),
-            "tar_age_s": f"{att.age(now):.2f}" if att.age(now) is not None else "",
+            "tar_age_s": f"{tage:.2f}" if tage is not None else "",
             "can_state": c.get("state", ""),
             "speed_mm_s": c.get("speed", ""),
             "angular_mrad_s": c.get("angular", ""),
             "soc_pct": c.get("soc", ""),
-            "can_age_s": f"{can.age(now):.2f}" if can.age(now) is not None else "",
+            "can_age_s": f"{cage:.2f}" if cage is not None else "",
         }
-        csv.write(",".join(str(vals[k]) for k in COLUMNS) + "\n")
+        self.csv.write(",".join(str(vals[k]) for k in COLUMNS) + "\n")
+        self.rows += 1
         return vals
 
+    # -- saving -----------------------------------------------------------
+    def summary(self):
+        lab = self.labeler
+        return {
+            "format": MARK_FORMAT,
+            "heading_ref": "true",
+            "antenna_offset_m": ANTENNA_OFFSET_M,
+            "heading_offset_deg": HEADING_OFFSET_DEG,
+            "marks_rejected": self.rejected,
+            "grid": ({"cols": lab.cols, "start_row": lab.start_row,
+                      "order": "serpentine along map rows",
+                      "skipped": list(self.skipped)} if self.grid else None),
+            "started_utc": self.stamp,
+            "duration_s": round(time.monotonic() - self.t0, 1),
+            "rows": self.rows,
+            "rtcm_bytes": self.feed.rtcm_bytes,
+            "gnss_source": self.feed.name,
+            "fix_quality_counts": self.fix_counts,
+            "marks": self.marks,
+            "csv": self.csv_path,
+        }
+
+    def save(self):
+        """Write the summary atomically: a crash mid-write leaves the
+        previous version, never half a file."""
+        tmp = self.json_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.summary(), f, indent=2)
+        os.replace(tmp, self.json_path)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.save()
+        for h in (self.csv, self.sock, self.feed):
+            try:
+                h.close()
+            except Exception:
+                pass
+
+
+def open_sources():
+    """(feed, can_sock, None) or (None, None, reason)."""
+    feed, why = open_feed()
+    if feed is None:
+        return None, None, f"{why} - run 'check'"
+    try:
+        sock = open_can()
+    except OSError as e:
+        feed.close()
+        return None, None, f"cannot open {CAN_IFACE}: {e}"
+    return feed, sock, None
+
+
+def cmd_log(args):
+    teach = args.command == "teach"
+    feed, sock, why = open_sources()
+    if feed is None:
+        print(why)
+        return 1
+    s = TeachSession(feed, sock, cols=getattr(args, "cols", None),
+                     start_row=getattr(args, "start_row", 1), teach=teach)
+    grid = s.grid
+
+    print(f"logging to {s.csv_path}")
+    if grid:
+        print(f"  plot names from the map grid, {args.cols} columns, starting "
+              f"at row {s.labeler.start_row}: first plot is {s.next_plot()}")
+        print("  n = plot   m = headland point   s = skip a plot   "
+              "u = undo   q = save")
+    else:
+        print("  m = mark    n = mark as next plot id    u = undo    q = stop")
+    if feed.name == "rtcm_forward":
+        print("  GNSS via rtcm_forward (the service keeps forwarding corrections)")
+    else:
+        print("  GNSS via the ports directly - rtcm_forward is not running")
+    print("  (teach_gui.py does the same with a plot map on screen)\n")
+
+    fd = sys.stdin.fileno()
+    old_term = termios.tcgetattr(fd)
+    pad = " " * 40
     try:
         tty.setcbreak(fd)
-        period = 1.0 / LOG_RATE_HZ
-        next_row = time.monotonic()
         next_status = time.monotonic() + 1.0
-
         while True:
             now = time.monotonic()
+            for kind, text, _ in s.poll(now):
+                bell = "\a" if kind == "refused" else ""
+                sys.stdout.write(f"\r  {text}{bell}{pad}\n")
+                if kind == "mark" and grid:
+                    sys.stdout.write(f"  next plot: {s.next_plot()}\n")
 
-            # GNSS: only readings that are new since the last poll
-            for kind, d, age in feed.poll(now):
-                if kind == "gga":
-                    gps.update(d, now - age)
-                    if pending is not None:
-                        pending["gga"].append(d)
-                    q = FIX_LABEL.get(d["fix_q"], d["fix_q"])
-                    fix_counts[q] = fix_counts.get(q, 0) + 1
-                else:
-                    att.update(d, now - age)
-                    if pending is not None:
-                        pending["hdg"].append(d.get("heading_deg"))
-
-            # CAN
-            while True:
-                try:
-                    raw = sock.recv(16)
-                except (BlockingIOError, OSError):
-                    break
-                cid, dlc, data = CAN_FRAME.unpack(raw)
-                if (cid & 0x1FFFFFFF) != COBID_TPDO1 or dlc < 8:
-                    continue
-                st, sp, ang = struct.unpack_from("<Bhh", data)
-                can.update({"state": st, "speed": sp, "angular": ang,
-                            "soc": data[7]}, now)
-                if pending is not None:
-                    pending["spd"].append(sp)
-
-            # keyboard
             if select.select([sys.stdin], [], [], 0)[0]:
                 c = sys.stdin.read(1).lower()
                 if c == "q":
                     break
-                if c in ("m", "n") and pending is None:
-                    numbered = c == "n" or (teach and not grid)
-                    label = (labeler.current() if numbered
-                             else f"mark_{len(marks)+1}")
-                    pending = {"label": label, "numbered": numbered,
-                               "t_end": now + MARK_AVG_S,
-                               "gga": [], "hdg": [], "spd": []}
+                if c in ("m", "n") and s.pending is None:
+                    label = s.mark("plot" if c == "n" else "headland", now)
                     sys.stdout.write(f"\r  {label}: hold still, averaging "
-                                     f"{MARK_AVG_S:.0f} s ...{' ' * 40}\n")
-                elif c == "s" and grid and pending is None:
-                    sys.stdout.write(f"\r  skipped {labeler.current()} "
-                                     f"(not marked){' ' * 40}\n")
-                    labeler.advance()
-                    sys.stdout.write(f"  next plot: {labeler.current()}\n")
-                elif c == "u" and pending is None:
-                    if marks:
-                        gone = marks.pop()
-                        if gone.get("kind") == "plot":
-                            labeler.back()
-                        snapshot(now, "mark_undone", gone["label"])
-                        rows += 1
-                        sys.stdout.write(f"\r  UNDONE {gone['label']}"
-                                         f"{' ' * 40}\n")
-                        sys.stdout.write(f"  next plot: {labeler.current()}\n")
+                                     f"{MARK_AVG_S:.0f} s ...{pad}\n")
+                elif c == "s" and grid and s.pending is None:
+                    name = s.skip()
+                    sys.stdout.write(f"\r  skipped {name} (not marked){pad}\n")
+                    sys.stdout.write(f"  next plot: {s.next_plot()}\n")
+                elif c == "u" and s.pending is None:
+                    r = s.undo(now)
+                    if r is None:
+                        sys.stdout.write(f"\r  nothing to undo{pad}\n")
                     else:
-                        sys.stdout.write("\r  nothing to undo\n")
+                        sys.stdout.write(f"\r  UNDONE {r[0]} {r[1]}{pad}\n")
+                        if grid:
+                            sys.stdout.write(f"  next plot: {s.next_plot()}\n")
 
-            # finish a mark once its averaging window has closed
-            if pending is not None and now >= pending["t_end"]:
-                label = pending["label"]
-                fields, why = average_mark(pending["gga"], pending["hdg"],
-                                           pending["spd"])
-                if fields is None:
-                    rejected += 1
-                    snapshot(now, "mark_rejected", label)
-                    rows += 1
-                    sys.stdout.write(
-                        f"\r  REFUSED {label}: {why}. "
-                        f"Not saved - press m to try again.\a\n")
-                else:
-                    v = snapshot(now, "mark", label)
-                    rows += 1
-                    mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"],
-                            "label": label,
-                            "kind": "plot" if pending["numbered"] else "headland"}
-                    if grid and pending["numbered"]:
-                        mark["row"], mark["col"] = labeler.rc()
-                    mark.update(fields)
-                    marks.append(mark)
-                    if pending["numbered"]:
-                        labeler.advance()
-                    sys.stdout.write(
-                        f"\r  MARK {label}  {fields['lat']:.9f},"
-                        f"{fields['lon']:.9f}  hdg {fields['heading_deg']:.1f}"
-                        f"  sd {fields['pos_sd_cm']:.1f} cm / "
-                        f"{fields['heading_sd_deg']:.2f} deg  "
-                        f"n={fields['n_samples']}  (rotation centre)\n")
-                    if pending["numbered"] and grid:
-                        sys.stdout.write(f"  next plot: {labeler.current()}\n")
-                pending = None
-
-            # periodic row
-            if now >= next_row:
-                snapshot(now)
-                rows += 1
-                next_row += period
-                if next_row < now:
-                    next_row = now + period
-
-            # status line
             if now >= next_status:
                 next_status = now + 1.0
-                g, c = gps.data, can.data
-                q = FIX_LABEL.get(g.get("fix_q", ""), "-")
-                stale = []
-                for nm, src in (("gps", gps), ("att", att), ("can", can)):
-                    a = src.age(now)
-                    if a is None or a > STALE_WARN_S:
-                        stale.append(nm)
-                warn = ("  STALE: " + ",".join(stale)) if stale else ""
+                st = s.status(now)
+                warn = ("  STALE: " + ",".join(st["stale"])) if st["stale"] else ""
                 sys.stdout.write(
-                    f"\r  {now-t0:7.1f}s  {q:<11} sats {g.get('nsat','--'):>2}  "
-                    f"hdg {true_heading(att.data.get('heading_deg')) or 0:7.2f}  "
-                    f"spd {c.get('speed','-'):>5} mm/s  "
-                    f"rows {rows:>6}  marks {len(marks):>3}{warn}   ")
+                    f"\r  {st['elapsed']:7.1f}s  {st['fix']:<11} sats "
+                    f"{st['nsat'] or '--':>2}  hdg {st['heading'] or 0:7.2f}  "
+                    f"spd {st['speed'] if st['speed'] is not None else '-':>5} mm/s  "
+                    f"rows {st['rows']:>6}  marks {st['marks']:>3}{warn}   ")
                 sys.stdout.flush()
-
             time.sleep(0.002)
-
     except KeyboardInterrupt:
         pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
-        csv.close()
-        sock.close()
-        feed.close()
+        s.close()
 
-    total = time.monotonic() - t0
-    summary = {
-        "format": MARK_FORMAT,
-        "heading_ref": "true",
-        "antenna_offset_m": ANTENNA_OFFSET_M,
-        "heading_offset_deg": HEADING_OFFSET_DEG,
-        "marks_rejected": rejected,
-        "grid": ({"cols": args.cols, "start_row": labeler.start_row,
-                  "order": "serpentine along map rows"} if grid else None),
-        "started_utc": stamp,
-        "duration_s": round(total, 1),
-        "rows": rows,
-        "rtcm_bytes": feed.rtcm_bytes,
-        "gnss_source": feed.name,
-        "fix_quality_counts": fix_counts,
-        "marks": marks,
-        "csv": csv_path,
-    }
-    with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(f"\n\n  {rows} rows over {total:.0f} s -> {csv_path}")
-    print(f"  {len(marks)} marks -> {json_path}"
-          + (f"   ({rejected} refused)" if rejected else ""))
-    if fix_counts:
-        tot = sum(fix_counts.values())
-        parts = [f"{k} {100*v/tot:.0f}%" for k, v in sorted(fix_counts.items())]
+    total = time.monotonic() - s.t0
+    print(f"\n\n  {s.rows} rows over {total:.0f} s -> {s.csv_path}")
+    print(f"  {len(s.marks)} marks -> {s.json_path}"
+          + (f"   ({s.rejected} refused)" if s.rejected else ""))
+    if s.fix_counts:
+        tot = sum(s.fix_counts.values())
+        parts = [f"{k} {100*v/tot:.0f}%" for k, v in sorted(s.fix_counts.items())]
         print(f"  fix quality: {', '.join(parts)}")
     return 0
 

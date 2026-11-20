@@ -1,6 +1,6 @@
 # Progress
 
-Status as of **19 Nov 2026**. Platform: farm-ng Amiga, College Station,
+Status as of **20 Nov 2026**. Platform: farm-ng Amiga, College Station,
 secondary machine with a secondary Pi 5.
 
 **Where it stands:** the Amiga drives itself to RTK waypoints and stops on
@@ -185,3 +185,9 @@ over a Unix socket (`capture_link.py`). Automatic or wait-for-operator per
 run. Teach names plots by the map (`--cols`). Cameras locked to 10 fps
 (config 1.2.0, ~80 MB/s instead of ~280) so one Pi can carry cameras and
 navigation. Tested in simulation only.
+
+**20 Nov 2026** - `teach_gui.py`: teach with the plot map on screen (plots
+red -> green, headland points counted per turn, a warning when a row is
+started without both turn points). Teach logic moved into one class shared
+with the terminal; the teach file is saved after every mark; fixed undo
+after skip naming the wrong plot. `CHANGES-2026-11-20.md`.
