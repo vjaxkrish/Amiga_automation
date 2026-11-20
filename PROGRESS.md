@@ -1,6 +1,6 @@
 # Progress
 
-Status as of **12 Nov 2026**. Platform: farm-ng Amiga, College Station,
+Status as of **19 Nov 2026**. Platform: farm-ng Amiga, College Station,
 secondary machine with a secondary Pi 5.
 
 **Where it stands:** the Amiga drives itself to RTK waypoints and stops on
@@ -23,7 +23,7 @@ itself.
 | 6 | **Close the loop.** Point-to-point, then a multi-waypoint mission | **DONE 27 Oct** - `goto` and a 4-waypoint `mission` |
 | 7 | **GPS error handling.** Shared geometry, averaged marks, hold on fix loss, per-plot heading | **DONE 11 Nov in simulation** - not yet driven |
 | 8 | **Teach-and-repeat serpentine with ground truth.** 2 rows, headland turn, tape at every plot | **first run 12 Nov**; retuned, re-run pending |
-| 9 | **Capture integration.** Camera trigger in the `mission` hook, flag and continue | not started |
+| 9 | **Capture integration.** Camera trigger in the `mission` hook, flag and continue | **written 19 Nov, simulation only** - camera app starts the run and captures at each plot (`CHANGES-2026-11-19.md`) |
 | 10 | **Dallas.** Fixed base survey, re-measure constants, reproduce | not started |
 
 ## What is proven on the wire or on the ground
@@ -86,6 +86,13 @@ Everything in this list was observed, not inferred.
   per-plot heading, `plan`, `rover_log.py` through `rtcm_forward`): 21 tests
   pass on the laptop and the rover Pi, including a simulated serpentine with
   an 8 s dropout. Not yet driven. `CHANGES-2026-11-11.md`
+- **Capture integration (19 Nov):** the camera app's Autonomous run screen
+  starts `amiga_nav.py mission --capture` and captures at each plot over
+  `capture_link.py`; plots are named `R{row}_C{col}` while teaching
+  (`rover_log.py teach --cols N`); camera config 1.2.0 locks 10 fps;
+  metadata schema v5 adds the GPS fields. 17 new tests, plus the real app
+  run end to end against the simulated Amiga (automatic, wait-for-operator,
+  stop mid-run). Not yet run on hardware. `CHANGES-2026-11-19.md`
 - **`follow`** has never driven, and `AlignGate` (used by `follow` and
   `replay`) turns the wrong way by the verified sign. Fix before use.
 - **`devices.py` auto-detection** only exercised against the College Station
@@ -170,3 +177,11 @@ against a simulator calibrated on that day's route: 1.5 cm deadband,
 post-turn creep fix, smoothed stopping, `yaw-test` added; row-line
 following built but left off (needs turning authority it lacks).
 `CHANGES-2026-11-12.md`.
+
+**19 Nov 2026** - Capture integration for Dallas, on one Pi
+(`CHANGES-2026-11-19.md`). Base: the 18 Sep camera app. Navigation stays its
+own process, started from the app's new Autonomous run screen; the two talk
+over a Unix socket (`capture_link.py`). Automatic or wait-for-operator per
+run. Teach names plots by the map (`--cols`). Cameras locked to 10 fps
+(config 1.2.0, ~80 MB/s instead of ~280) so one Pi can carry cameras and
+navigation. Tested in simulation only.

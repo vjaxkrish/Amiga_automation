@@ -31,7 +31,13 @@ import time
 import tty
 from datetime import datetime, timezone
 
-import serial
+try:
+    import serial       # only needed when rtcm_forward is NOT running
+except ImportError:     # e.g. launched from the camera app's venv
+    serial = None
+import signal
+
+import capture_link
 
 # ============================================================================
 #  CALIBRATION - verify these on the machine before trusting any of it
@@ -635,6 +641,10 @@ class Rover:
             if not lgp or not rdp:
                 raise SystemExit("LG580P or radio not found")
             print("note: rtcm_forward not running, using the ports directly")
+            if serial is None:
+                raise SystemExit("rtcm_forward is not running and pyserial is "
+                                 "not installed for this Python - start the "
+                                 "service: sudo systemctl start rtcm-forward")
             self.lg = serial.Serial(lgp, LG580P_BAUD, timeout=0)
             self.radio = serial.Serial(rdp, RADIO_BAUD, timeout=0)
         self.sock = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
@@ -843,7 +853,8 @@ class GpsHold:
         return "hold"
 
 
-def drive_loop(rover, step_fn, label="", on_resume=None, stats=None):
+def drive_loop(rover, step_fn, label="", on_resume=None, stats=None,
+               notify=None):
     """Run step_fn(now, rover) -> (speed, angular, done, status). 20 Hz.
 
     GPS faults (stale position or heading, fix not RTK fixed, old
@@ -852,7 +863,8 @@ def drive_loop(rover, step_fn, label="", on_resume=None, stats=None):
     calls on_resume(now, held_s) so the controller can shift its timers, and
     carries on. Hard faults (CAN, Dashboard state) stop immediately.
 
-    stats, if given, is a dict filled with hold count and time."""
+    stats, if given, is a dict filled with hold count and time.
+    notify, if given, is called notify("hold", reason) / notify("resume")."""
     period = 1.0 / CONTROL_HZ
     nxt = time.monotonic()
     t_start = nxt
@@ -876,12 +888,17 @@ def drive_loop(rover, step_fn, label="", on_resume=None, stats=None):
                 stopped_why = why
                 break
 
+            was_holding = hold.active
             h = hold.update(now, rover.gps_fault(now))
+            if notify is not None and h == "hold" and not was_holding:
+                notify("hold", hold.reason)
             if h == "timeout":
                 stopped_why = (f"GPS lost {now - hold.since:.0f} s "
                                f"({hold.reason}), gave up")
                 break
             if h == "resume":
+                if notify is not None:
+                    notify("resume", None)
                 print(f"  {now - t_start:6.2f}  {label}GPS back, resuming "
                       f"(hold #{hold.count})")
                 if on_resume is not None:
@@ -1399,7 +1416,8 @@ def cmd_plan(args):
 RUN_COLUMNS = ["t_utc", "label", "result", "stop_err_cm", "along_cm",
                "cross_cm", "heading_err_deg", "fix_q", "corr_age_s",
                "gps_ok_at_capture", "gps_fault_in_dwell", "gps_holds",
-               "gps_hold_s", "lat", "lon", "heading_deg"]
+               "gps_hold_s", "lat", "lon", "heading_deg",
+               "capture", "capture_detail"]
 
 
 def stop_error(frame, rover, tx, ty, final_hdg):
@@ -1414,19 +1432,110 @@ def stop_error(frame, rover, tx, ty, final_hdg):
     return math.hypot(ex, ey), along, left, herr
 
 
+def keepalive_wait(rover, done=None, timeout=None):
+    """Hold the machine still - AUTO_ACTIVE, zero motion, at the control
+    rate so the Dashboard watchdog never starves - until done() is true or
+    timeout seconds pass. Returns (outcome, first_gps_fault):
+    outcome is "done", "timeout", or a hard-fault reason to stop on."""
+    t_end = None if timeout is None else time.monotonic() + timeout
+    gps_seen = None
+    while True:
+        now = time.monotonic()
+        rover.poll(now)
+        hf = rover.hard_fault(now)
+        if hf:
+            return hf, gps_seen
+        gf = rover.gps_fault(now)
+        if gf and gps_seen is None:
+            gps_seen = gf
+        rover.send(STATE_AUTO_ACTIVE, 0, 0)
+        if done is not None and done():
+            return "done", gps_seen
+        if t_end is not None and now >= t_end:
+            return "timeout", gps_seen
+        time.sleep(1.0 / CONTROL_HZ)
+
+
+def open_capture_link(args, marks, run_id):
+    """Connect to the camera app and check every plot name against its plot
+    map BEFORE the machine moves. Returns (client, None) or (None, reason)."""
+    link = capture_link.CaptureClient(args.capture_socket)
+    try:
+        link.connect()
+    except OSError as e:
+        return None, (f"camera app not reachable at {link.path} ({e}). Start "
+                      f"it and open Autonomous run first.")
+    labels = [m["label"] for m in marks
+              if capture_link.parse_plot_label(m["label"])]
+    try:
+        link.send({"type": "hello", "protocol": capture_link.PROTOCOL,
+                   "run_id": run_id, "teach": os.path.abspath(args.path),
+                   "mode": args.capture_mode, "labels": labels})
+        t_end = time.monotonic() + 5.0
+        while time.monotonic() < t_end:
+            for msg in link.poll():
+                if msg.get("type") == "hello_ok":
+                    if not msg.get("ok"):
+                        link.close()
+                        bad = msg.get("invalid") or []
+                        return None, ("camera app refused the run: "
+                                      + (msg.get("detail") or "")
+                                      + (f" Not in its plot map: "
+                                         f"{', '.join(bad[:10])}" if bad else ""))
+                    warm = msg.get("warmup_remaining_s") or 0
+                    if warm > 0:
+                        print(f"  NOTE: camera warm-up has {warm:.0f} s left; "
+                              f"captures before then are flagged warmup_ok=False")
+                    print(f"  camera app ready, plot map "
+                          f"'{msg.get('map')}', {len(labels)} plots to capture")
+                    return link, None
+            time.sleep(0.05)
+    except capture_link.LinkClosed as e:
+        return None, f"camera app link failed: {e}"
+    link.close()
+    return None, "camera app did not answer"
+
+
+MISSION_DEFAULTS = {"capture": False, "capture_mode": "auto",
+                    "capture_socket": None, "settle": 1.0,
+                    "capture_timeout": 30.0, "dwell": DWELL_S,
+                    "resume": False, "heading": None}
+
+
 def cmd_mission(args):
+    for k, v in MISSION_DEFAULTS.items():     # callers other than argparse
+        if not hasattr(args, k):
+            setattr(args, k, v)
     marks = load_marks_json(args.path)
     base = os.path.splitext(args.path)[0]
     done_path = base + "_completed.txt"
     completed = set()
     if os.path.exists(done_path) and args.resume:
-        completed = set(open(done_path).read().split())
+        with open(done_path) as fh:
+            completed = set(fh.read().split())
         print(f"resuming, {len(completed)} already done")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_path = f"{base}_run_{stamp}.csv"
 
+    link = None
+    if args.capture:
+        todo_marks = [m for m in marks if m["label"] not in completed]
+        link, why = open_capture_link(args, todo_marks, stamp)
+        if link is None:
+            print(f"refusing: {why}")
+            return 1
+    elif any(capture_link.parse_plot_label(m["label"]) for m in marks):
+        print("NOTE: plot names found but --capture not given: driving "
+              "and dwelling only, nothing will be captured.\n")
+
+    def tell(**kw):
+        if link is not None:
+            link.status(**kw)
+
     rover = Rover()
     rover.open()
+    w = None
+    current = None
     try:
         if not wait_ready(rover):
             return 1
@@ -1456,8 +1565,11 @@ def cmd_mission(args):
             w.writerow(RUN_COLUMNS)
             print(f"run log -> {run_path}\n")
 
-            for m in todo:
+            tell(state="running", total=len(todo), run_log=run_path)
+            for idx, m in enumerate(todo, 1):
                 label = m["label"]
+                current = label
+                tell(state="driving", label=label, index=idx, total=len(todo))
                 tx, ty = frame.to_xy(m["lat"], m["lon"])
                 cx, cy = control_point(frame, rover.lat, rover.lon,
                                        rover.heading)
@@ -1465,8 +1577,11 @@ def cmd_mission(args):
                                               args.heading)
                 ctl = GotoController(frame, tx, ty, final_hdg)
                 stats = {}
-                why = drive_loop(rover, ctl.step, label=f"{label}  ",
-                                 on_resume=ctl.on_resume, stats=stats)
+                why = drive_loop(
+                    rover, ctl.step, label=f"{label}  ",
+                    on_resume=ctl.on_resume, stats=stats,
+                    notify=lambda ev, why, lab=label: tell(
+                        state=ev, label=lab, detail=why))
                 if why != "complete":
                     w.writerow([datetime.now(timezone.utc).isoformat(
                         timespec="seconds"), label, f"stopped: {why}"]
@@ -1474,47 +1589,112 @@ def cmd_mission(args):
                     print(f"  stopping at {label}: {why}")
                     print(f"  completed plots are in {done_path}; "
                           f"carry on with --resume")
+                    tell(state="stopped", label=label, detail=why)
                     return 1
 
                 err, along, cross, herr = stop_error(frame, rover, tx, ty,
                                                      final_hdg)
+                rc = capture_link.parse_plot_label(label)
                 print(f"  {label}: stopped {err*100:.1f} cm from target "
-                      f"(along {along*100:+.1f}, cross {cross*100:+.1f} cm), "
-                      f"dwell {args.dwell:.0f} s")
+                      f"(along {along*100:+.1f}, cross {cross*100:+.1f} cm)")
+                tell(state="arrived", label=label, index=idx, total=len(todo),
+                     detail=f"{err*100:.1f} cm (along {along*100:+.1f}, "
+                            f"cross {cross*100:+.1f})")
 
-                # Fix quality checked at the moment of capture - this is
-                # where it matters most. drive_loop only returns "complete"
-                # with a good fix, but say so explicitly and record it.
-                now = time.monotonic()
-                rover.poll(now)
-                gps_ok = rover.gps_fault(now) is None
-                fix_q, corr_age = rover.fix_q, rover.corr_age
-
-                # ---- capture hook goes here ----
-                # Trigger the camera app, confirm it wrote, then continue.
-                # Flag and continue on failure; do not abort the session.
-                # Pass it: label, gps_ok, err/along/cross, fix_q, corr_age.
-
+                capture, capture_detail = "", ""
                 dwell_fault = None
-                t_end = time.monotonic() + args.dwell
-                while time.monotonic() < t_end:
+                if link is not None and rc:
+                    # Let the frame stop swaying, then check the fix at the
+                    # moment of capture - where it matters most.
+                    out, dwell_fault = keepalive_wait(rover, timeout=args.settle)
+                    if out not in ("done", "timeout"):
+                        print(f"  stopping at {label}: {out}")
+                        tell(state="stopped", label=label, detail=out)
+                        return 1
                     now = time.monotonic()
                     rover.poll(now)
-                    hf = rover.hard_fault(now)
-                    if hf:
-                        print(f"  stopping during dwell at {label}: {hf}")
+                    gps_ok = rover.gps_fault(now) is None
+                    fix_q, corr_age = rover.fix_q, rover.corr_age
+                    err, along, cross, herr = stop_error(frame, rover, tx, ty,
+                                                         final_hdg)
+                    nav = {"run_id": stamp,
+                           "teach_file": os.path.basename(args.path),
+                           "mark_label": label, "trigger": args.capture_mode,
+                           "lat": round(rover.lat, 9),
+                           "lon": round(rover.lon, 9),
+                           "heading_deg": round(rover.heading, 2),
+                           "fix_quality": fix_q, "corr_age_s": corr_age,
+                           "gps_ok": gps_ok,
+                           "stop_err_cm": round(err * 100, 2),
+                           "along_cm": round(along * 100, 2),
+                           "cross_cm": round(cross * 100, 2),
+                           "heading_err_deg": round(herr, 2),
+                           "gps_holds": stats.get("gps_holds", 0)}
+                    try:
+                        rid = link.request_capture(label, rc[0], rc[1],
+                                                   args.capture_mode, nav)
+                    except capture_link.LinkClosed as e:
+                        print(f"  stopping at {label}: camera app gone ({e})")
+                        tell(state="stopped", label=label, detail=str(e))
                         return 1
-                    gf = rover.gps_fault(now)
-                    if gf and dwell_fault is None:
-                        dwell_fault = gf
-                    rover.send(STATE_AUTO_ACTIVE, 0, 0)
-                    time.sleep(1.0 / CONTROL_HZ)
+                    if args.capture_mode == "wait":
+                        print(f"  {label}: waiting for you to capture in the "
+                              f"camera app (SPACE), or skip (S)")
+                    reply = {}
+
+                    def got_reply():
+                        for msg in link.poll():
+                            if msg.get("type") == "result" and \
+                                    msg.get("id") == rid:
+                                reply.update(msg)
+                        return bool(reply)
+
+                    timeout = (args.capture_timeout
+                               if args.capture_mode == "auto" else None)
+                    try:
+                        out, gf = keepalive_wait(rover, got_reply, timeout)
+                    except capture_link.LinkClosed as e:
+                        print(f"  stopping at {label}: camera app gone ({e})")
+                        return 1
+                    dwell_fault = dwell_fault or gf
+                    if out == "done":
+                        capture = reply.get("status", "failed")
+                        capture_detail = reply.get("detail", "")
+                    elif out == "timeout":
+                        capture = "failed"
+                        capture_detail = (f"no answer from the camera app in "
+                                          f"{args.capture_timeout:.0f} s")
+                    else:
+                        print(f"  stopping at {label}: {out}")
+                        tell(state="stopped", label=label, detail=out)
+                        return 1
+                    print(f"  {label}: capture {capture.upper()}"
+                          + (f" - {capture_detail}" if capture_detail else ""))
+                elif link is None:
+                    now = time.monotonic()
+                    rover.poll(now)
+                    gps_ok = rover.gps_fault(now) is None
+                    fix_q, corr_age = rover.fix_q, rover.corr_age
+                    out, dwell_fault = keepalive_wait(rover, timeout=args.dwell)
+                    if out not in ("done", "timeout"):
+                        print(f"  stopping during dwell at {label}: {out}")
+                        return 1
+                else:
+                    # headland point in a capturing run: nothing to image
+                    now = time.monotonic()
+                    rover.poll(now)
+                    gps_ok = rover.gps_fault(now) is None
+                    fix_q, corr_age = rover.fix_q, rover.corr_age
 
                 result = "ok"
                 if not gps_ok or dwell_fault:
                     result = "flag_gps"
                     print(f"  {label}: FLAGGED - GPS "
                           f"{'not good at capture' if not gps_ok else dwell_fault}")
+                if capture in ("quarantined", "failed"):
+                    result = "flag_capture" if result == "ok" else result
+                elif capture == "skipped":
+                    result = "skipped"
                 if stats.get("gps_holds"):
                     print(f"  {label}: {stats['gps_holds']} GPS hold(s), "
                           f"{stats['gps_hold_s']:.0f} s")
@@ -1526,13 +1706,34 @@ def cmd_mission(args):
                     int(gps_ok), dwell_fault or "",
                     stats.get("gps_holds", 0), stats.get("gps_hold_s", 0.0),
                     f"{rover.lat:.9f}", f"{rover.lon:.9f}",
-                    f"{rover.heading:.2f}"])
+                    f"{rover.heading:.2f}", capture, capture_detail])
+                tell(state="done_mark", label=label, index=idx,
+                     total=len(todo), detail=result)
                 done_fh.write(label + "\n")
                 done_fh.flush()
 
         print("\nmission complete")
+        tell(state="complete")
+    except KeyboardInterrupt:
+        print(f"\n  stopped by operator at {current or 'start'}; "
+              f"carry on with --resume")
+        tell(state="stopped", label=current, detail="operator")
+        return 130
     finally:
+        # Whatever happened, leave the machine stopped and out of active.
+        for _ in range(5):
+            try:
+                rover.send(STATE_AUTO_READY, 0, 0)
+            except Exception:
+                break
+            time.sleep(1.0 / CONTROL_HZ)
         rover.close()
+        if link is not None:
+            try:
+                link.send({"type": "bye"})
+            except capture_link.LinkClosed:
+                pass
+            link.close()
     return 0
 
 
@@ -1730,6 +1931,18 @@ def main():
     m = sub.add_parser("mission")
     m.add_argument("path")
     m.add_argument("--resume", action="store_true")
+    m.add_argument("--capture", action="store_true",
+                   help="ask the camera app to capture at every R{row}_C{col} "
+                        "plot (Autonomous run screen must be open)")
+    m.add_argument("--capture-mode", choices=("auto", "wait"), default="auto",
+                   help="auto: capture by itself; wait: you press SPACE")
+    m.add_argument("--capture-socket", default=None,
+                   help=f"default {capture_link.DEFAULT_SOCKET} or "
+                        f"${capture_link.SOCKET_ENV}")
+    m.add_argument("--settle", type=float, default=1.0,
+                   help="seconds to stand still before a capture")
+    m.add_argument("--capture-timeout", type=float, default=30.0,
+                   help="auto mode: give up on a capture after this long")
     m.add_argument("--heading", type=float, default=None,
                    help="override: square EVERY mark to this bearing instead "
                         "of its taught heading. Wrong on a serpentine route.")
@@ -1747,6 +1960,14 @@ def main():
     pl.add_argument("--heading", type=float, default=None)
 
     args = p.parse_args()
+
+    # A stop from the camera app arrives as SIGTERM or SIGINT. Both become
+    # KeyboardInterrupt, so every exit path runs the same finally blocks that
+    # leave the Amiga stopped and out of AUTO_ACTIVE.
+    def _stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _stop)
+
     fn = {"replay": cmd_replay, "follow": cmd_follow,
           "goto": cmd_goto, "mission": cmd_mission, "plan": cmd_plan,
           "yaw-test": cmd_yaw_test,

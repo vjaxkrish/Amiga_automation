@@ -15,9 +15,20 @@ this open the radio and receiver itself and forward RTCM on its own.
     python3 rover_log.py teach              same, but 'm' marks a waypoint
     python3 rover_log.py check              one-shot: are all three sources alive
 
+    python3 rover_log.py drive --cols 9 --start-row 1
+            teach with plot-map names: plots are labelled R{row}_C{col}
+            in the order they are driven - along map rows, serpentine:
+            odd rows C1 -> C{cols}, even rows C{cols} -> C1. For a block
+            that starts further down, give its first row (--start-row 3).
+
 While running:
-    m       mark the current position (teach mode: a plot centre)
-    n       mark and label the next mark with an incrementing plot id
+    m       mark the current position (teach mode: a plot centre;
+            with --cols: a headland point, never captured)
+    n       mark and label the next plot (plot_001... or, with --cols,
+            the next R{row}_C{col})
+    s       with --cols: skip the next plot name without marking (a plot
+            that is missing or cannot be reached)
+    u       undo the last mark (a plot's name is handed back)
     q       stop and write the summary
 
 A mark is not one reading. Pressing m starts a 3 s average with the machine
@@ -445,6 +456,39 @@ def cmd_check(args):
     return 0
 
 
+class PlotLabeler:
+    """Names plots in the order they are driven.
+
+    Without a grid: plot_001, plot_002, ...
+    With a grid (cols): R{row}_C{col}, serpentine along map rows - odd rows
+    run C1 -> C{cols}, even rows C{cols} -> C1 - matching the plot map in
+    the camera app, so a capture lands in that plot's folder."""
+
+    def __init__(self, cols=None, start_row=1):
+        self.cols = cols
+        self.start_row = start_row
+        self.k = 0
+
+    def rc(self, k=None):
+        k = self.k if k is None else k
+        row = self.start_row + k // self.cols
+        pos = k % self.cols
+        col = pos + 1 if row % 2 == 1 else self.cols - pos
+        return row, col
+
+    def current(self):
+        if not self.cols:
+            return f"plot_{self.k + 1:03d}"
+        r, c = self.rc()
+        return f"R{r}_C{c}"
+
+    def advance(self):
+        self.k += 1
+
+    def back(self):
+        self.k = max(0, self.k - 1)
+
+
 def cmd_log(args):
     teach = args.command == "teach"
     feed, why = open_feed()
@@ -470,12 +514,19 @@ def cmd_log(args):
     marks = []
     pending = None             # a mark being averaged: label, t_end, samples
     rejected = 0
-    plot_id = 1
+    grid = bool(getattr(args, "cols", None))
+    labeler = PlotLabeler(getattr(args, "cols", None),
+                          getattr(args, "start_row", 1) or 1)
     rows = 0
     fix_counts = {}
     t0 = time.monotonic()
 
     print(f"logging to {csv_path}")
+    if grid:
+        print(f"  plot names from the map grid, {args.cols} columns, starting "
+              f"at row {labeler.start_row}: first plot is {labeler.current()}")
+        print("  n = plot   m = headland point   s = skip a plot   "
+              "u = undo   q = save")
     if feed.name == "rtcm_forward":
         print("  GNSS via rtcm_forward (the service keeps forwarding corrections)")
     else:
@@ -565,14 +616,31 @@ def cmd_log(args):
                 if c == "q":
                     break
                 if c in ("m", "n") and pending is None:
-                    numbered = teach or c == "n"
-                    label = (f"plot_{plot_id:03d}" if numbered
+                    numbered = c == "n" or (teach and not grid)
+                    label = (labeler.current() if numbered
                              else f"mark_{len(marks)+1}")
                     pending = {"label": label, "numbered": numbered,
                                "t_end": now + MARK_AVG_S,
                                "gga": [], "hdg": [], "spd": []}
                     sys.stdout.write(f"\r  {label}: hold still, averaging "
                                      f"{MARK_AVG_S:.0f} s ...{' ' * 40}\n")
+                elif c == "s" and grid and pending is None:
+                    sys.stdout.write(f"\r  skipped {labeler.current()} "
+                                     f"(not marked){' ' * 40}\n")
+                    labeler.advance()
+                    sys.stdout.write(f"  next plot: {labeler.current()}\n")
+                elif c == "u" and pending is None:
+                    if marks:
+                        gone = marks.pop()
+                        if gone.get("kind") == "plot":
+                            labeler.back()
+                        snapshot(now, "mark_undone", gone["label"])
+                        rows += 1
+                        sys.stdout.write(f"\r  UNDONE {gone['label']}"
+                                         f"{' ' * 40}\n")
+                        sys.stdout.write(f"  next plot: {labeler.current()}\n")
+                    else:
+                        sys.stdout.write("\r  nothing to undo\n")
 
             # finish a mark once its averaging window has closed
             if pending is not None and now >= pending["t_end"]:
@@ -590,17 +658,22 @@ def cmd_log(args):
                     v = snapshot(now, "mark", label)
                     rows += 1
                     mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"],
-                            "label": label}
+                            "label": label,
+                            "kind": "plot" if pending["numbered"] else "headland"}
+                    if grid and pending["numbered"]:
+                        mark["row"], mark["col"] = labeler.rc()
                     mark.update(fields)
                     marks.append(mark)
                     if pending["numbered"]:
-                        plot_id += 1
+                        labeler.advance()
                     sys.stdout.write(
                         f"\r  MARK {label}  {fields['lat']:.9f},"
                         f"{fields['lon']:.9f}  hdg {fields['heading_deg']:.1f}"
                         f"  sd {fields['pos_sd_cm']:.1f} cm / "
                         f"{fields['heading_sd_deg']:.2f} deg  "
                         f"n={fields['n_samples']}  (rotation centre)\n")
+                    if pending["numbered"] and grid:
+                        sys.stdout.write(f"  next plot: {labeler.current()}\n")
                 pending = None
 
             # periodic row
@@ -646,6 +719,8 @@ def cmd_log(args):
         "antenna_offset_m": ANTENNA_OFFSET_M,
         "heading_offset_deg": HEADING_OFFSET_DEG,
         "marks_rejected": rejected,
+        "grid": ({"cols": args.cols, "start_row": labeler.start_row,
+                  "order": "serpentine along map rows"} if grid else None),
         "started_utc": stamp,
         "duration_s": round(total, 1),
         "rows": rows,
@@ -675,7 +750,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=COMMANDS)
+    p.add_argument("--cols", type=int, default=None,
+                   help="plot-map columns: name plots R{row}_C{col}, serpentine")
+    p.add_argument("--start-row", type=int, default=1,
+                   help="with --cols: the map row this teach starts on")
     args = p.parse_args()
+    if args.cols is not None and args.cols < 1:
+        p.error("--cols must be at least 1")
     return COMMANDS[args.command](args)
 
 
