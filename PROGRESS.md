@@ -1,6 +1,6 @@
 # Progress
 
-Status as of **20 Nov 2026**. Platform: farm-ng Amiga, College Station,
+Status as of **20 Nov 2026** (evening). Platform: farm-ng Amiga, College Station,
 secondary machine with a secondary Pi 5.
 
 **Where it stands:** the Amiga drives itself to RTK waypoints and stops on
@@ -24,7 +24,7 @@ itself.
 | 7 | **GPS error handling.** Shared geometry, averaged marks, hold on fix loss, per-plot heading | **DONE 11 Nov in simulation** - not yet driven |
 | 8 | **Teach-and-repeat serpentine with ground truth.** 2 rows, headland turn, tape at every plot | **first run 12 Nov**; retuned, re-run pending |
 | 9 | **Capture integration.** Camera trigger in the `mission` hook, flag and continue | **written 19 Nov, simulation only** - camera app starts the run and captures at each plot (`CHANGES-2026-11-19.md`) |
-| 10 | **Dallas.** Fixed base survey, re-measure constants, reproduce | not started |
+| 10 | **Dallas.** Fixed base survey, re-measure constants (`commission.py`), reproduce | tools ready 20 Nov; not started |
 
 ## What is proven on the wire or on the ground
 
@@ -193,3 +193,11 @@ with the terminal; the teach file is saved after every mark; fixed undo
 after skip naming the wrong plot. Plots are marked with `t` (was `n`,
 next to `m`); a skipped plot can be clicked to come back and teach it.
 `CHANGES-2026-11-20.md`.
+Later the same day, for the move to the Dallas Amiga (4 ft track, heavier;
+the GNSS kit moves over, so everything is re-measured): plots are never
+turned on (straight rows); headland points are joined by a planned rolling
+curve instead of pivots; per-machine profile file (`~/amiga_vehicle.json`)
+with a sideways antenna offset; command ramps against mast swing;
+`commission.py` measures heading offset, antenna position, breakaway, turn
+efficiency, ramps and curve radius and writes the profile; fixed a
+controller giving up being counted as arrived. Simulation only.

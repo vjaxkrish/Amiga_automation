@@ -29,6 +29,7 @@ import unittest
 from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ["AMIGA_PROFILE"] = "none"      # never a machine's profile in tests
 
 import vehicle                                   # noqa: E402
 import amiga_nav as nav                          # noqa: E402
@@ -449,11 +450,14 @@ class PerPlotHeading(unittest.TestCase):
         pts, plots = serpentine(rows=2, plots=4)
         rc, rows, done, sim, out = run_mission(pts, plots)
         self.assertEqual(rc, 0, out[-2000:])
+        # Since 20 Nov plots are never turned on (STRAIGHT_ROWS): no
+        # rotation in place on any plot at all, and the image is taken
+        # facing the way the robot drove in - a few degrees at most.
         worst = max(sim.rot_in_plot.values() or [0.0])
-        self.assertLess(worst, 10.0, sim.rot_in_plot)
+        self.assertLess(worst, 0.5, sim.rot_in_plot)
         for r in rows:
             if r["label"].startswith("plot_"):
-                self.assertLess(abs(float(r["heading_err_deg"])), 2.5, r)
+                self.assertLess(abs(float(r["heading_err_deg"])), 5.0, r)
 
     def test_single_heading_override_spins_row_two(self):
         """The old behaviour, for contrast: --heading 0 on a serpentine."""

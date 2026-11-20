@@ -37,6 +37,7 @@ import unittest
 from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ["AMIGA_PROFILE"] = "none"      # never a machine's profile in tests
 
 import amiga_nav as nav                              # noqa: E402
 import test_gps_handling as T                        # noqa: E402
@@ -294,6 +295,7 @@ class RollingFloor(unittest.TestCase):
                 got["v"] = nav.struct.unpack_from("<Bhh", data)
 
         r.sock = S()
+        r.ramp = False              # the floor is under test, not the ramp
         with Patch(**patch):
             r.send(nav.STATE_AUTO_ACTIVE, lin, ang)
         return got["v"][2]
@@ -337,15 +339,45 @@ class YawTestPlumbing(unittest.TestCase):
         self.assertEqual(floor, 40)
 
 
+class Turf:
+    """Temporarily change the simulated turf response."""
+
+    def __init__(self, roll, pivot):
+        self.roll, self.pivot = roll, pivot
+
+    def __enter__(self):
+        self.old = (dict(EFF_ROLL), dict(EFF_PIVOT))
+        EFF_ROLL.update(left=self.roll, right=self.roll)
+        EFF_PIVOT.update(left=self.pivot, right=self.pivot)
+
+    def __exit__(self, *a):
+        EFF_ROLL.clear(), EFF_ROLL.update(self.old[0])
+        EFF_PIVOT.clear(), EFF_PIVOT.update(self.old[1])
+
+
+def field_mission(seed=1, **patch):
+    pts, plots = T.serpentine(rows=2, plots=4)
+    saved = T.SimRover
+    T.SimRover = FieldSim
+    try:
+        with Patch(**patch):
+            return T.run_mission(pts, plots, seed=seed)
+    finally:
+        T.SimRover = saved
+
+
 class SerpentineWithSlip(unittest.TestCase):
 
     def test_two_rows(self):
-        """2 rows x 4 plots with a headland turn, measured turf response."""
+        """2 rows x 4 plots with a headland turn, measured turf response.
+        The College Station machine (1 ft track): pivot turns at the
+        headland, as driven on 12 Nov."""
         pts, plots = T.serpentine(rows=2, plots=4)
         saved = T.SimRover
         T.SimRover = FieldSim
         try:
-            rc, rows, done, sim, out = T.run_mission(pts, plots)
+            with Patch(HEADLAND_TURN="pivot"):
+                rc, rows, done, sim, out = T.run_mission(pts, plots)
         finally:
             T.SimRover = saved
         self.assertEqual(rc, 0, out[-2000:])
@@ -356,6 +388,114 @@ class SerpentineWithSlip(unittest.TestCase):
               f"{wc:.1f} cm (GPS-reported)")
         self.assertLessEqual(wa, 2.0)
         self.assertLess(wc, 4.0)
+
+
+class HeadlandArcs(unittest.TestCase):
+    """The rolling headland curve (20 Nov) on simulated turf.
+
+    College Station turf (12 Nov calibration, ~18% of a commanded turn
+    while rolling, 1 ft track) and a better-turning machine standing in for
+    the 4 ft Dallas Amiga (50%), which is not measured yet."""
+
+    def check_run(self, rc, rows, sim, out, cross_max):
+        self.assertEqual(rc, 0, out[-2500:])
+        labels = [r["label"] for r in rows]
+        self.assertEqual(labels[4], "turn_1a")
+        self.assertEqual(rows[4]["result"], "passed")     # rolled through
+        self.assertLess(max(sim.rot_in_plot.values() or [0.0]), 0.5)
+        pl = [r for r in rows if r["label"].startswith("plot_")]
+        wc = max(abs(float(r["cross_cm"])) for r in pl)
+        wa = max(abs(float(r["along_cm"])) for r in pl)
+        self.assertLess(wa, 2.0)
+        self.assertLess(wc, cross_max)
+        return wa, wc
+
+    def test_dallas_like_turf_curves_and_straight_rows(self):
+        with Turf(0.5, 0.6):
+            for seed in (1, 2, 3):
+                rc, rows, done, sim, out = field_mission(
+                    seed, ARC_YAW_EFFICIENCY=0.5, ARC_RADIUS_M=2.0,
+                    ANGULAR_MIN_ROLLING_MRAD_S=110)
+                wa, wc = self.check_run(rc, rows, sim, out, 4.5)
+                print(f"\n    50% turf, seed {seed}: worst along {wa:.1f} "
+                      f"cross {wc:.1f} cm", end="")
+
+    def test_college_station_turf_needs_slow_curve(self):
+        """On 18% turf a 2 m curve needs more turn than the 600 mrad/s cap
+        at 300 mm/s; at 150 mm/s with the efficiency known it holds."""
+        with Turf(0.18, 0.25):
+            rc, rows, done, sim, out = field_mission(
+                1, ARC_YAW_EFFICIENCY=0.18, ARC_RADIUS_M=2.0,
+                ARC_SPEED_MM_S=150)
+            self.check_run(rc, rows, sim, out, 4.0)
+
+    def test_curve_the_turf_cannot_hold_stops_not_wanders(self):
+        with Turf(0.18, 0.25):
+            rc, rows, done, sim, out = field_mission(
+                1, ARC_YAW_EFFICIENCY=1.0, ARC_RADIUS_M=2.0,
+                ARC_SPEED_MM_S=300)
+        self.assertEqual(rc, 1)
+        self.assertIn("off the planned turn", out)
+        self.assertEqual(sim.cmd[1:], (0, 0))
+        self.assertEqual(sim.cmd[0], nav.STATE_AUTO_READY)
+
+
+class Ramps(unittest.TestCase):
+    """Command ramps against mast swing (20 Nov)."""
+
+    def setUp(self):
+        self.clock = T.FakeTime()
+        self.saved = nav.time
+        nav.time = self.clock
+        self.r = nav.Rover()
+        self.sent = []
+        outer = self
+
+        class S:
+            def send(self, raw):
+                cid, dlc, data = nav.CAN_FRAME.unpack(raw)
+                outer.sent.append(nav.struct.unpack_from("<Bhh", data))
+        self.r.sock = S()
+
+    def tearDown(self):
+        nav.time = self.saved
+
+    def ticks(self, n, lin, ang, state=None):
+        for _ in range(n):
+            self.r.send(state or nav.STATE_AUTO_ACTIVE, lin, ang)
+            self.clock.t += 0.05
+        return self.sent[-1]
+
+    def test_turn_rate_ramps_up_and_down(self):
+        with Patch(ANG_SLEW_MRAD_S2=1200.0, ANGULAR_MIN_MRAD_S=220,
+                   ANGULAR_MIN_ROLLING_MRAD_S=220):
+            self.ticks(1, 0, 0)
+            _, _, a1 = self.ticks(1, 0, 350)
+            self.assertLessEqual(abs(a1), 61)            # 1200 * 0.05
+            _, _, a = self.ticks(10, 0, 350)
+            self.assertEqual(a, 350)
+            _, _, a = self.ticks(1, 0, 0)
+            self.assertEqual(a, 290)                     # ramps down too
+
+    def test_slowing_down_is_never_delayed(self):
+        with Patch(LIN_ACCEL_MM_S2=500.0):
+            self.ticks(1, 0, 0)
+            _, l1, _ = self.ticks(1, 500, 0)
+            self.assertLessEqual(l1, 26)
+            self.ticks(40, 500, 0)
+            _, l, _ = self.ticks(1, 0, 0)
+            self.assertEqual(l, 0)
+
+    def test_stop_state_goes_straight_out(self):
+        with Patch(ANG_SLEW_MRAD_S2=1200.0):
+            self.ticks(20, 300, 300)
+            st, l, a = self.ticks(1, 0, 0, state=nav.STATE_AUTO_READY)
+            self.assertEqual((st, l, a), (nav.STATE_AUTO_READY, 0, 0))
+
+    def test_none_means_no_ramp(self):
+        with Patch(ANG_SLEW_MRAD_S2=None, LIN_ACCEL_MM_S2=None):
+            self.ticks(1, 0, 0)
+            self.assertEqual(self.ticks(1, 400, 300)[1:], (400, 300))
 
 
 if __name__ == "__main__":

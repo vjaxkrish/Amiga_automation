@@ -15,8 +15,12 @@ new. What it adds is the picture:
 
 and, at the end of each row on the side where the turn is, how many
 headland points ('m') have been taught for that turn. A turn needs two:
-one about 5 m past the row's last plot, and one lined up on the next row
-(the lead-in). With fewer, the robot cuts the corner into the next row.
+the run-out point, just past the row's last plot with the machine clear of
+the plots (~2 m), and the lead-in point level with it on the next row,
+facing down that row. The robot drives one smooth curve between them
+(amiga_nav.py HEADLAND_TURN "arc"); `amiga_nav.py plan` shows how much
+headland the curve needs beyond them. With fewer than two, the robot cuts
+the corner into the next row.
 
     python3 teach_gui.py                       pick the map in the window
     python3 teach_gui.py --map "2023 SA NTEP" --start-row 3

@@ -20,6 +20,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ["AMIGA_PROFILE"] = "none"      # never a machine's profile in tests
 
 import amiga_nav as nav                          # noqa: E402
 import rover_log                                 # noqa: E402

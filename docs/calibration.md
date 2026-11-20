@@ -175,3 +175,13 @@ requirement for Dallas.
 The second line cost two debugging cycles. Getting it backwards makes the
 error grow instead of shrink: observed 13 deg -> 77 deg over 12 s of turning
 the wrong way, and separately 105 s stuck oscillating at +/-179 deg.
+
+## Since 20 Nov 2026: commission.py and the machine profile
+
+The numbers in this file were measured by hand on the College Station
+machine. For any other machine (the Dallas Amiga), run
+`python3 commission.py all` on open ground instead: it measures heading
+offset, antenna position (forward and sideways), breakaway speeds, rolling
+turn efficiency, command ramps against mast swing and the tightest headland
+curve, and writes them to `~/amiga_vehicle.json`, which vehicle.py and
+amiga_nav.py load. No code edits. See CHANGES-2026-11-20.md.

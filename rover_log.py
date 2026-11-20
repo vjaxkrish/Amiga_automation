@@ -69,6 +69,7 @@ try:
 except ImportError:          # a laptop without pyserial: teach_gui --demo
     serial = None
 
+import vehicle
 from vehicle import (ANTENNA_OFFSET_M, HEADING_OFFSET_DEG, true_heading,
                      rotation_centre, circular_mean_deg, metres_between)
 
@@ -183,8 +184,9 @@ def average_mark(gga, raw_headings, speeds):
         "n_samples": len(pts),
         "pos_sd_cm": round(sd * 100, 2),
         "heading_sd_deg": round(hsd, 3),
-        "antenna_offset_m": ANTENNA_OFFSET_M,
-        "heading_offset_deg": HEADING_OFFSET_DEG,
+        "antenna_offset_m": vehicle.ANTENNA_OFFSET_M,
+        "antenna_lateral_m": vehicle.ANTENNA_LATERAL_M,
+        "heading_offset_deg": vehicle.HEADING_OFFSET_DEG,
     }, None
 
 
@@ -785,8 +787,10 @@ class TeachSession:
         return {
             "format": MARK_FORMAT,
             "heading_ref": "true",
-            "antenna_offset_m": ANTENNA_OFFSET_M,
-            "heading_offset_deg": HEADING_OFFSET_DEG,
+            "antenna_offset_m": vehicle.ANTENNA_OFFSET_M,
+            "antenna_lateral_m": vehicle.ANTENNA_LATERAL_M,
+            "heading_offset_deg": vehicle.HEADING_OFFSET_DEG,
+            "machine": vehicle.PROFILE.get("machine", "college-station (built-in)"),
             "marks_rejected": self.rejected,
             "grid": ({"cols": lab.cols, "start_row": lab.start_row,
                       "order": "serpentine along map rows",

@@ -22,6 +22,7 @@ import csv as csvmod
 import json
 import math
 import os
+import re
 import select
 import socket
 import struct
@@ -47,6 +48,7 @@ import capture_link
 # rover_log.py. They used to be defined separately in each file and drifted
 # apart (0.65 here, 0.794 there), and rover_log never applied the heading
 # offset at all. See vehicle.py and docs/calibration.md.
+import vehicle                                        # noqa: E402
 from vehicle import (ANTENNA_OFFSET_M, HEADING_OFFSET_DEG, EARTH_R,
                      true_heading, rotation_centre, metres_between)
 
@@ -217,6 +219,41 @@ GPS_HOLD_MAX_S = 90.0          # give up waiting for the fix after this
 # hold this long before moving again.
 GPS_RESUME_GOOD_S = 2.0
 
+# ---- Straight rows (2026-11-20) ---------------------------------------------
+# Plots are never turned at: no squaring-up turn on arrival, no turn in place
+# at the start of a leg that begins on a plot. The robot stops on the plot
+# facing the way it drove in. A leg that would need a turn in place inside
+# the rows is not driven - the run stops and says so.
+STRAIGHT_ROWS = True
+NO_PIVOT_MAX_DEG = 30.0        # more off than this inside the rows = stop
+PLOT_HEADING_WARN_DEG = 5.0    # plan: plot taught this far off its row line
+
+# ---- Arced headland turns (2026-11-20) ---------------------------------------
+# Two headland points in a row (end of one row, lead-in of the next) are
+# joined by a planned curve - the shortest path of fixed radius between the
+# two poses (a Dubins path), usually a "bulb" turn - and the robot follows
+# it rolling, without stopping at the first point or pivoting. "pivot" goes
+# back to the old way: stop on each point and turn in place.
+HEADLAND_TURN = "arc"          # "arc" | "pivot"
+ARC_RADIUS_M = 2.0             # commission.py measures what the machine holds
+ARC_SPEED_MM_S = 300           # on the curve
+ARC_LOOKAHEAD_M = 0.8          # pure pursuit lookahead along the path
+ARC_YAW_EFFICIENCY = 1.0       # rotation achieved / commanded while rolling
+                               # (College Station turf ~0.18; Dallas: measure)
+ARC_MAX_DEV_M = 0.6            # further off the planned curve = stop
+ARC_HANDOFF_M = 0.5            # last bit of the curve done by the point controller
+ARC_STALL_S = 15.0             # no progress along the curve for this long = stop
+PATH_DS_M = 0.05               # path sample spacing
+ARC_PLOT_CLEAR_M = 1.2         # plan warns if the curve passes nearer a plot
+
+# ---- Command ramps: stop the GNSS mast swinging (2026-11-20) -----------------
+# A step change in turn rate whips the mast; the antenna then swings for a
+# second or two and every reading in that time is wrong by the swing. The
+# turn rate is ramped both ways, the forward speed ramped up (slowing down
+# is never delayed). None = no ramp. commission.py swing measures them.
+ANG_SLEW_MRAD_S2 = 1200.0
+LIN_ACCEL_MM_S2 = 500.0
+
 # ============================================================================
 #  Hardware
 # ============================================================================
@@ -271,11 +308,12 @@ def bearing_to(dx, dy):
 
 
 def control_point(frame, lat, lon, heading_deg):
-    """Vehicle rotation centre in local metres, from the antenna fix."""
+    """Vehicle rotation centre in local metres, from the antenna fix.
+    The antenna geometry comes from vehicle.centre_shift - the same function
+    the teach code uses - so teach and replay cannot disagree."""
     x, y = frame.to_xy(lat, lon)
-    th = math.radians(heading_deg)
-    return (x - ANTENNA_OFFSET_M * math.sin(th),
-            y - ANTENNA_OFFSET_M * math.cos(th))
+    de, dn = vehicle.centre_shift(heading_deg)
+    return x + de, y + dn
 
 
 def vehicle_frame(dx, dy, heading_deg):
@@ -322,6 +360,16 @@ def _f(v):
         return None
 
 
+_PLOT_LABEL = re.compile(r"^(R\d+_C\d+|plot_\d+)$")
+
+
+def mark_kind(label):
+    """'plot' or 'headland' for a mark without a stored kind (files taught
+    before 19 Nov). Plots are named R{row}_C{col} or plot_NNN; anything else
+    (mark_N, turn_1a, ...) is a headland point."""
+    return "plot" if _PLOT_LABEL.match(str(label or "")) else "headland"
+
+
 def load_marks_json(path, verbose=True):
     """Teach summary -> list of marks, each a dict:
         label, lat, lon     rotation centre to drive to
@@ -360,7 +408,8 @@ def load_marks_json(path, verbose=True):
                 moved.append((m.get("label"), d))
         out.append({"label": m["label"], "lat": lat, "lon": lon,
                     "heading": hdg, "fix_q": str(m.get("fix_q", "")),
-                    "pos_sd_cm": _f(m.get("pos_sd_cm"))})
+                    "pos_sd_cm": _f(m.get("pos_sd_cm")),
+                    "kind": m.get("kind") or mark_kind(m["label"])})
     if not out:
         raise SystemExit(f"no marks in {path}")
     if verbose and moved:
@@ -622,6 +671,11 @@ class Rover:
         self.t_can = None
         self.sock = None
         self.angular_floor = True     # yaw-test turns it off
+        self.ramp = True              # command ramps (commission turns off)
+        self.pitch = None
+        self.heading_raw = None
+        self._last_cmd = (0.0, 0.0)
+        self._t_cmd = None
         self.lg = None
         self.radio = None
         self.from_state = False
@@ -673,7 +727,9 @@ class Rover:
                 age = max(0.0, time.time() - st["t_wall"])
                 self.t_pos = now - age
                 if st.get("heading_deg") is not None:
+                    self.heading_raw = st["heading_deg"]
                     self.heading = true_heading(st["heading_deg"])
+                    self.pitch = st.get("pitch_deg")
                     self.t_head = now - age
             self._poll_can(now)
             return
@@ -706,7 +762,12 @@ class Rover:
                     h = float(f[8])
                 except (ValueError, IndexError):
                     continue
+                self.heading_raw = h
                 self.heading = true_heading(h)
+                try:
+                    self.pitch = float(f[6])
+                except (ValueError, IndexError):
+                    self.pitch = None
                 self.t_head = now
 
         self._poll_can(now)
@@ -732,9 +793,32 @@ class Rover:
                      else ANGULAR_MIN_MRAD_S)
             if ang and abs(ang) < floor:
                 ang = math.copysign(floor, ang)
-        ang = int(max(-MAX_ANGULAR_MRAD_S, min(MAX_ANGULAR_MRAD_S, ang)))
+        ang = max(-MAX_ANGULAR_MRAD_S, min(MAX_ANGULAR_MRAD_S, ang))
+        lin, ang = self._ramped(state, lin, ang)
+        lin, ang = int(round(lin)), int(round(ang))
         self.sock.send(CAN_FRAME.pack(
             COBID_RPDO1, 8, struct.pack("<Bhh3x", state, lin, ang)))
+
+    def _ramped(self, state, lin, ang):
+        """Limit how fast the commands change (ANG_SLEW_MRAD_S2,
+        LIN_ACCEL_MM_S2) so the mast is not whipped. Slowing down is never
+        delayed, and anything but AUTO_ACTIVE (a stop) goes straight out."""
+        now = time.monotonic()
+        dt = 0.0 if self._t_cmd is None else min(0.2, max(0.0, now - self._t_cmd))
+        self._t_cmd = now
+        if not self.ramp or state != STATE_AUTO_ACTIVE:
+            self._last_cmd = (float(lin), float(ang))
+            return lin, ang
+        last_lin, last_ang = self._last_cmd
+        if LIN_ACCEL_MM_S2 and abs(lin) > abs(last_lin):
+            base = last_lin if last_lin * lin > 0 else 0.0
+            step = LIN_ACCEL_MM_S2 * dt
+            lin = base + max(-step, min(step, lin - base))
+        if ANG_SLEW_MRAD_S2:
+            step = ANG_SLEW_MRAD_S2 * dt
+            ang = last_ang + max(-step, min(step, ang - last_ang))
+        self._last_cmd = (float(lin), float(ang))
+        return lin, ang
 
     def gps_fault(self, now):
         """A reason the POSITION cannot be trusted right now, or None.
@@ -853,6 +937,9 @@ class GpsHold:
         return "hold"
 
 
+FAILED_WORDS = ("STOPPED", "ABORT", "STALLED")
+
+
 def drive_loop(rover, step_fn, label="", on_resume=None, stats=None,
                notify=None):
     """Run step_fn(now, rover) -> (speed, angular, done, status). 20 Hz.
@@ -929,7 +1016,11 @@ def drive_loop(rover, step_fn, label="", on_resume=None, stats=None,
                 # print the final status before breaking - it carries the
                 # arrival numbers, which are the whole point of the run
                 print(f"  {now - t_start:6.2f}  {label}{status}")
-                stopped_why = "complete"
+                # A controller that gives up also returns done - but that is
+                # NOT an arrival. Before 2026-11-20 these were reported as
+                # "complete" and the mission carried on to the next mark.
+                stopped_why = (status if status.split(":")[0].split()[0]
+                               in FAILED_WORDS else "complete")
                 break
 
             if now >= nxt:
@@ -990,10 +1081,14 @@ class GotoController:
     zero cleanly.
     """
 
-    def __init__(self, frame, tx, ty, final_heading=None):
+    def __init__(self, frame, tx, ty, final_heading=None, align_ok=True):
+        """align_ok False: this leg starts inside the rows, so it may not
+        turn in place - small heading errors are steered out while rolling,
+        large ones stop the run (NO_PIVOT_MAX_DEG)."""
         self.frame = frame
         self.tx, self.ty = tx, ty
         self.final_heading = final_heading
+        self.align_ok = align_ok
         self.state = "align"
         self.lock_bearing = None
         self.arrive_err = None
@@ -1079,6 +1174,14 @@ class GotoController:
                     self.row_mode = True
                     self.lock_bearing = self.final_heading
 
+        if self.state == "align" and not self.align_ok:
+            if abs(berr) > NO_PIVOT_MAX_DEG and dist > ARRIVE_RADIUS_M * 5:
+                return 0, 0, True, \
+                    f"STOPPED: needs a {berr:+.0f} deg turn in place to " \
+                    f"reach this mark, and it is inside the rows - turn it " \
+                    f"by hand (or re-teach), then resume"
+            self.state = "drive"
+
         if self.state == "align":
             if self.row_mode:
                 berr = wrap180(self.lock_bearing - rover.heading)
@@ -1098,7 +1201,13 @@ class GotoController:
                            f"{'left' if d > 0 else 'right'}  {elapsed:4.1f}s"
 
         if self.state == "drive":
-            if abs(berr) > HEADING_ALIGN_DEG and self.lock_bearing is None:
+            if not self.align_ok and abs(berr) > NO_PIVOT_MAX_DEG and \
+                    self.lock_bearing is None:
+                return 0, 0, True, \
+                    f"STOPPED: {berr:+.0f} deg off with {dist:.2f} m to go, " \
+                    f"inside the rows - not turning in place here"
+            if self.align_ok and abs(berr) > HEADING_ALIGN_DEG and \
+                    self.lock_bearing is None:
                 self.state = "align"
                 d = self._latch(berr, now)
                 return 0, ANGULAR_SIGN * d * TURN_IN_PLACE_MRAD_S, False, \
@@ -1212,8 +1321,8 @@ class GotoController:
                 if elapsed > ALIGN_STALL_S and \
                         abs(herr) > self.turn_start_err - 5.0:
                     return 0, 0, True, \
-                        f"stopped {self.arrive_err*100:.2f} cm from target; " \
-                        f"final turn stalled at {herr:+.1f} deg"
+                        f"STALLED: stopped {self.arrive_err*100:.2f} cm from " \
+                        f"target; final turn stalled at {herr:+.1f} deg"
                 return 0, ANGULAR_SIGN * d * TURN_SLOW_MRAD_S, False, \
                     f"turn    heading err {herr:+7.2f} deg  coarse"
 
@@ -1228,6 +1337,9 @@ class GotoController:
             on = min(PULSE_MAX_S,
                      max(PULSE_MIN_S,
                          math.radians(abs(herr)) / (TURN_SLOW_MRAD_S / 1000.0)))
+            if ANG_SLEW_MRAD_S2:
+                # the turn rate ramps up, so a pulse needs that long extra
+                on += TURN_SLOW_MRAD_S / ANG_SLEW_MRAD_S2
             self.pulse_until = now + on
             self.pulse_rest = self.pulse_until + PULSE_REST_S
             return 0, 0, False, \
@@ -1277,6 +1389,246 @@ class GotoController:
                 f"fix     along {along*100:+6.2f} cm  cross {cross*100:+6.2f} cm"
 
         return 0, 0, True, "done"
+
+
+# ============================================================================
+#  Planned curves: Dubins paths and a path follower (headland turns)
+# ============================================================================
+
+def _mod2pi(a):
+    return a % (2.0 * math.pi)
+
+
+def _dubins_words(a, b, d):
+    """Normalised (t, p, q) for each Dubins word, Shkel & Lumelsky form.
+    a, b: start / end angle relative to the start->end line; d: distance /
+    radius. Candidates are checked by integration afterwards, so a wrong
+    formula can only lose a word, never return a wrong path."""
+    sa, sb, ca, cb = math.sin(a), math.sin(b), math.cos(a), math.cos(b)
+    cab = math.cos(a - b)
+    out = {}
+    p2 = 2 + d * d - 2 * cab + 2 * d * (sa - sb)
+    if p2 >= 0:
+        tmp = math.atan2(cb - ca, d + sa - sb)
+        out["LSL"] = (_mod2pi(-a + tmp), math.sqrt(p2), _mod2pi(b - tmp))
+    p2 = 2 + d * d - 2 * cab + 2 * d * (sb - sa)
+    if p2 >= 0:
+        tmp = math.atan2(ca - cb, d - sa + sb)
+        out["RSR"] = (_mod2pi(a - tmp), math.sqrt(p2), _mod2pi(-b + tmp))
+    p2 = -2 + d * d + 2 * cab + 2 * d * (sa + sb)
+    if p2 >= 0:
+        p = math.sqrt(p2)
+        tmp = math.atan2(-ca - cb, d + sa + sb) - math.atan2(-2.0, p)
+        out["LSR"] = (_mod2pi(-a + tmp), p, _mod2pi(-b + tmp))
+    p2 = d * d - 2 + 2 * cab - 2 * d * (sa + sb)
+    if p2 >= 0:
+        p = math.sqrt(p2)
+        tmp = math.atan2(ca + cb, d - sa - sb) - math.atan2(2.0, p)
+        out["RSL"] = (_mod2pi(a - tmp), p, _mod2pi(b - tmp))
+    tmp = (6.0 - d * d + 2 * cab + 2 * d * (sa - sb)) / 8.0
+    if abs(tmp) <= 1:
+        p = _mod2pi(2 * math.pi - math.acos(tmp))
+        t = _mod2pi(a - math.atan2(ca - cb, d - sa + sb) + p / 2.0)
+        out["RLR"] = (t, p, _mod2pi(a - b - t + p))
+    tmp = (6.0 - d * d + 2 * cab + 2 * d * (sb - sa)) / 8.0
+    if abs(tmp) <= 1:
+        p = _mod2pi(2 * math.pi - math.acos(tmp))
+        t = _mod2pi(-a - math.atan2(ca - cb, d + sa - sb) + p / 2.0)
+        out["LRL"] = (t, p, _mod2pi(b - a - t + p))
+    return out
+
+
+def _dubins_walk(x, y, th, word, params, rho, ds):
+    """Sample a Dubins word from (x, y, th) - th counter-clockwise from east,
+    the maths convention - every ds metres. Returns [(x, y, th, kappa)]."""
+    pts = [(x, y, th, 0.0)]
+    for seg, length in zip(word, params):
+        n = max(1, int(math.ceil(length * rho / ds)))
+        step = length / n
+        for _ in range(n):
+            if seg == "L":
+                x += rho * (math.sin(th + step) - math.sin(th))
+                y += rho * (-math.cos(th + step) + math.cos(th))
+                th += step
+                k = 1.0 / rho
+            elif seg == "R":
+                x += rho * (-math.sin(th - step) + math.sin(th))
+                y += rho * (math.cos(th - step) - math.cos(th))
+                th -= step
+                k = -1.0 / rho
+            else:
+                x += rho * step * math.cos(th)
+                y += rho * step * math.sin(th)
+                k = 0.0
+            pts.append((x, y, th, k))
+    return pts
+
+
+def dubins_path(start, end, radius, ds=None):
+    """Shortest forward path of minimum turn radius `radius` from pose
+    start = (x, y, heading_deg) to end = (x, y, heading_deg), headings
+    clockwise from north as everywhere else in this file.
+
+    Returns (word, length_m, pts) with pts = [(x, y, heading_deg, kappa)],
+    kappa > 0 turning left. Raises ValueError if nothing fits (cannot
+    happen for a valid Dubins problem; the check guards the formulas)."""
+    ds = ds or PATH_DS_M
+    x0, y0, h0 = start
+    x1, y1, h1 = end
+    t0 = math.radians(90.0 - h0)
+    t1 = math.radians(90.0 - h1)
+    dx, dy = x1 - x0, y1 - y0
+    D = math.hypot(dx, dy)
+    d = D / radius
+    ang = math.atan2(dy, dx) if D > 1e-9 else 0.0
+    a, b = _mod2pi(t0 - ang), _mod2pi(t1 - ang)
+    best = None
+    for word, prm in _dubins_words(a, b, d).items():
+        length = sum(prm) * radius
+        if best is not None and length >= best[1] - 1e-9:
+            continue
+        pts = _dubins_walk(x0, y0, t0, word, prm, radius, ds)
+        ex, ey, et, _ = pts[-1]
+        if math.hypot(ex - x1, ey - y1) > 1e-3 * max(1.0, radius) or \
+                abs(wrap180(math.degrees(et - t1))) > 0.1:
+            continue                       # formula sign slip: discard
+        best = (word, length, pts)
+    if best is None:
+        raise ValueError("no Dubins path found")
+    word, length, pts = best
+    return word, length, [(px, py, (90.0 - math.degrees(pt)) % 360.0, k)
+                          for px, py, pt, k in pts]
+
+
+def line_path(x0, y0, x1, y1, ds=None):
+    """Straight samples from (x0, y0) to (x1, y1), heading along it."""
+    ds = ds or PATH_DS_M
+    L = math.hypot(x1 - x0, y1 - y0)
+    h = bearing_to(x1 - x0, y1 - y0) if L > 1e-9 else 0.0
+    n = max(1, int(math.ceil(L / ds)))
+    return [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n, h, 0.0)
+            for i in range(n + 1)]
+
+
+def turn_extent(pts, start_heading):
+    """How far a path reaches beyond its start, in the start's frame:
+    (max forward m, max left m, max right m)."""
+    x0, y0 = pts[0][0], pts[0][1]
+    fwd = left = right = 0.0
+    for x, y, _, _ in pts:
+        f, l_ = vehicle_frame(x - x0, y - y0, start_heading)
+        fwd, left, right = max(fwd, f), max(left, l_), max(right, -l_)
+    return fwd, left, right
+
+
+class PathFollower:
+    """Follow a sampled path rolling (pure pursuit along it), then hand the
+    last ARC_HANDOFF_M to the point controller to stop on the end mark and
+    square up there - the end is a headland point, so that turn is allowed.
+
+    Closed loop, not a fixed turn command: the turf gives a different
+    fraction of every commanded turn, so the planned curve is chased with
+    GPS every tick, and ARC_YAW_EFFICIENCY scales the command up to what
+    the ground eats. Off the curve by ARC_MAX_DEV_M = stop: the headland may
+    be too tight, or the machine cannot hold this radius."""
+
+    def __init__(self, frame, pts, final_heading=None, label="curve"):
+        self.frame = frame
+        self.pts = pts
+        self.final_heading = final_heading
+        self.label = label
+        self.i = 0
+        self.goto = None
+        self.max_dev = 0.0
+        self.last_progress_t = None
+        self.last_i = 0
+        n = len(pts)
+        self.cum = [0.0] * n
+        for k in range(1, n):
+            self.cum[k] = self.cum[k - 1] + math.hypot(
+                pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1])
+
+    @property
+    def length(self):
+        return self.cum[-1]
+
+    def on_resume(self, now):
+        self.last_progress_t = now
+        if self.goto is not None:
+            self.goto.on_resume(now)
+
+    def _closest(self, x, y):
+        n = len(self.pts)
+        best, bi = None, self.i
+        hi = min(n, self.i + int(3.0 / PATH_DS_M) + 1)
+        for k in range(self.i, hi):
+            d = (self.pts[k][0] - x) ** 2 + (self.pts[k][1] - y) ** 2
+            if best is None or d < best:
+                best, bi = d, k
+        return bi
+
+    def step(self, now, rover):
+        if self.goto is not None:
+            return self.goto.step(now, rover)
+        x, y = control_point(self.frame, rover.lat, rover.lon, rover.heading)
+        if self.last_progress_t is None:
+            self.last_progress_t = now
+        self.i = self._closest(x, y)
+        if self.i > self.last_i:
+            self.last_i, self.last_progress_t = self.i, now
+        px, py, ph, _ = self.pts[self.i]
+        _, dev = vehicle_frame(x - px, y - py, ph)
+        self.max_dev = max(self.max_dev, abs(dev))
+        remaining = self.cum[-1] - self.cum[self.i]
+
+        if abs(dev) > ARC_MAX_DEV_M:
+            return 0, 0, True, \
+                f"STOPPED: {abs(dev):.2f} m off the planned {self.label} " \
+                f"(limit {ARC_MAX_DEV_M:.2f}) - headland too tight for " \
+                f"ARC_RADIUS_M {ARC_RADIUS_M:.1f}, or the turf will not hold it"
+        if now - self.last_progress_t > ARC_STALL_S:
+            return 0, 0, True, \
+                f"STOPPED: no progress along the {self.label} for " \
+                f"{ARC_STALL_S:.0f} s"
+        herr = wrap180(ph - rover.heading)
+        if abs(herr) > 75.0:
+            return 0, 0, True, \
+                f"STOPPED: facing {herr:+.0f} deg off the {self.label}"
+
+        if remaining <= ARC_HANDOFF_M:
+            ex, ey, eh, _ = self.pts[-1]
+            fh = self.final_heading if self.final_heading is not None else eh
+            self.goto = GotoController(self.frame, ex, ey, fh, align_ok=True)
+            return 0, 0, False, \
+                f"{self.label}: done, max {self.max_dev*100:.0f} cm off the " \
+                f"curve - finishing on the point"
+
+        # speed: slow on the curve and just before it, cruise on straights
+        look_k = min(len(self.pts) - 1,
+                     self.i + int(1.2 / PATH_DS_M))
+        curvy = any(abs(self.pts[k][3]) > 0.05
+                    for k in range(self.i, look_k + 1))
+        speed = ARC_SPEED_MM_S if curvy else CRUISE_SPEED_MM_S
+        speed = min(speed, ramp_speed(remaining))
+
+        # pure pursuit at a point ARC_LOOKAHEAD_M further along the path
+        target_s = self.cum[self.i] + ARC_LOOKAHEAD_M
+        k = self.i
+        while k < len(self.pts) - 1 and self.cum[k] < target_s:
+            k += 1
+        tx, ty = self.pts[k][0], self.pts[k][1]
+        if k == len(self.pts) - 1 and self.cum[-1] < target_s:
+            # extend past the end along the end heading
+            extra = target_s - self.cum[-1]
+            eh = math.radians(self.pts[-1][2])
+            tx += extra * math.sin(eh)
+            ty += extra * math.cos(eh)
+        mrad, _, _ = steer(x, y, rover.heading, tx, ty, speed)
+        eff = ARC_YAW_EFFICIENCY if ARC_YAW_EFFICIENCY else 1.0
+        mrad = max(-MAX_ANGULAR_MRAD_S, min(MAX_ANGULAR_MRAD_S, mrad / eff))
+        return speed, mrad, False, \
+            f"{self.label:<6} {remaining:5.2f} m left  off {dev*100:+5.1f} cm  " \
+            f"hdg {herr:+6.1f} deg  {speed} mm/s"
 
 
 def make_goto_step(frame, tx, ty, final_heading=None):
@@ -1386,20 +1738,184 @@ def plan_legs(frame, marks, start_xy, override=None):
     return legs
 
 
-def print_plan(legs):
-    print(f"  {'mark':<10} {'leg m':>6} {'approach':>9} {'final':>7} {'turn':>7}")
+def print_plan(legs, marks=None):
+    kinds = {m["label"]: (m.get("kind") or mark_kind(m["label"]))
+             for m in (marks or [])}
+    print(f"  {'mark':<10} {'leg m':>6} {'approach':>9} {'taught':>7} "
+          f"{'diff':>7}")
+    skewed = []
     for L in legs:
         ap = "-" if L["approach"] is None else f"{L['approach']:.1f}"
         fh = "-" if L["final"] is None else f"{L['final']:.1f}"
-        flag = "   <- turns in place" if abs(L["turn"]) > BIG_TURN_DEG else ""
+        kind = kinds.get(L["label"], mark_kind(L["label"]))
+        flag = ""
+        if kind == "plot" and STRAIGHT_ROWS:
+            if abs(L["turn"]) > PLOT_HEADING_WARN_DEG:
+                flag = "   <- taught skewed to its row line"
+                skewed.append(L["label"])
+        elif abs(L["turn"]) > BIG_TURN_DEG and HEADLAND_TURN != "arc":
+            flag = "   <- turns in place (headland)"
         print(f"  {L['label']:<10} {L['dist']:6.2f} {ap:>9} {fh:>7} "
               f"{L['turn']:+7.1f}{flag}")
-    big = [L["label"] for L in legs if abs(L["turn"]) > BIG_TURN_DEG]
-    if big:
-        print(f"\n  {len(big)} mark(s) end with a turn over {BIG_TURN_DEG:.0f} deg: "
-              f"{', '.join(big)}.\n  That should only be headland transit "
-              f"points. A plot here means it was taught facing a different "
-              f"way than it is approached.")
+    if STRAIGHT_ROWS:
+        print("\n  plots: driven straight, never turned on (the image is "
+              "taken facing the way the robot drove in)")
+    if skewed:
+        print(f"  {len(skewed)} plot(s) taught more than "
+              f"{PLOT_HEADING_WARN_DEG:.0f} deg off the line they are "
+              f"driven on: {', '.join(skewed)}.\n  Their images will be "
+              f"rotated by that much. The first plot of a row is measured "
+              f"from the lead-in point, so re-teach that point square "
+              f"to the row if it is the one flagged.")
+
+
+def is_headland(m):
+    return (m.get("kind") or mark_kind(m.get("label"))) == "headland"
+
+
+def headland_chain(todo, i):
+    """Index of the last headland point in the run starting at todo[i]."""
+    j = i
+    while j + 1 < len(todo) and is_headland(todo[j + 1]):
+        j += 1
+    return j
+
+
+def mark_pose(frame, m, toward=None):
+    """(x, y, heading) of a mark; heading = taught, else toward the next."""
+    x, y = frame.to_xy(m["lat"], m["lon"])
+    h = m.get("heading")
+    if h is None and toward is not None:
+        h = bearing_to(toward[0] - x, toward[1] - y)
+    return x, y, (0.0 if h is None else h)
+
+
+def curve_through(frame, start_xy, start_hdg, chain, via_line):
+    """Sampled path: (optionally) a straight line from the start to the
+    first headland point, then Dubins curves point to point along the chain."""
+    pts = []
+    poses = []
+    for k, m in enumerate(chain):
+        nxt = None
+        if k + 1 < len(chain):
+            nxt = frame.to_xy(chain[k + 1]["lat"], chain[k + 1]["lon"])
+        poses.append(mark_pose(frame, m, nxt))
+    if via_line:
+        x1, y1, _ = poses[0]
+        pts = line_path(start_xy[0], start_xy[1], x1, y1)
+        cur = poses[0]
+        rest = poses[1:]
+    else:
+        cur = (start_xy[0], start_xy[1], start_hdg)
+        rest = poses
+    for pose in rest:
+        _, _, seg = dubins_path(cur, pose, ARC_RADIUS_M)
+        pts = pts + (seg[1:] if pts else seg)
+        cur = pose
+    return pts
+
+
+def plan_mission_leg(frame, rover, todo, i, prev, override=None):
+    """The controller for the next leg of a mission, which mark it ends on,
+    and which headland points it rolls through without stopping.
+
+    Plots (STRAIGHT_ROWS): no squaring-up turn on arrival; no turn in place
+    at the start of the leg if it starts on a plot (prev is a plot).
+    Headland points: arcs between them (HEADLAND_TURN "arc") - from a plot
+    the curve starts with the straight run-out to the first point and does
+    not stop there; otherwise point to point with a final turn as before."""
+    m = todo[i]
+    cx, cy = control_point(frame, rover.lat, rover.lon, rover.heading)
+    on_plot = prev is not None and not is_headland(prev)
+    arcs = HEADLAND_TURN == "arc" and override is None
+    if arcs and is_headland(m):
+        j = headland_chain(todo, i)
+        chain = todo[i:j + 1]
+        starts_at_headland = prev is not None and is_headland(prev)
+        if j > i and on_plot:
+            # last plot -> run-out point -> ... -> lead-in, without stopping
+            pts = curve_through(frame, (cx, cy), rover.heading, chain, True)
+            end = chain[-1]
+            pf = PathFollower(frame, pts, end.get("heading"),
+                              label="turn")
+            return pf, j, todo[i:j]
+        if starts_at_headland:
+            # standing on a headland point: curve from here
+            pts = curve_through(frame, (cx, cy), rover.heading, chain, False)
+            pf = PathFollower(frame, pts, chain[-1].get("heading"),
+                              label="turn")
+            return pf, j, todo[i:j]
+    tx, ty = frame.to_xy(m["lat"], m["lon"])
+    fh = final_heading_for(m, bearing_to(tx - cx, ty - cy), override)
+    plot = not is_headland(m)
+    if STRAIGHT_ROWS and plot and override is None:
+        fh = None                      # never turn on a plot
+    align_ok = not (STRAIGHT_ROWS and on_plot and override is None)
+    return GotoController(frame, tx, ty, fh, align_ok=align_ok), i, []
+
+
+def plan_turns(frame, marks):
+    """Headland curves the mission will drive (arc mode): for each run of
+    headland points after a plot, the planned path, its length and how far
+    it reaches. Returns a list of dicts."""
+    out = []
+    if HEADLAND_TURN != "arc":
+        return out
+    plots = [frame.to_xy(m["lat"], m["lon"]) for m in marks
+             if not is_headland(m)]
+    i = 0
+    while i < len(marks):
+        if is_headland(marks[i]) and i > 0 and not is_headland(marks[i - 1]) \
+                and i + 1 < len(marks) and is_headland(marks[i + 1]):
+            j = headland_chain(marks, i)
+            chain = marks[i:j + 1]
+            px, py = frame.to_xy(marks[i - 1]["lat"], marks[i - 1]["lon"])
+            ph = marks[i - 1].get("heading")
+            if ph is None:
+                x1, y1 = frame.to_xy(chain[0]["lat"], chain[0]["lon"])
+                ph = bearing_to(x1 - px, y1 - py)
+            pts = curve_through(frame, (px, py), ph, chain, True)
+            # extent measured from the run-out point
+            k0 = next(k for k, p in enumerate(pts) if abs(p[3]) > 0) \
+                if any(abs(p[3]) > 0 for p in pts) else 0
+            fwd, left, right = turn_extent(pts[max(0, k0 - 1):], ph)
+            # clearance of the CURVED part only - the straight run-out
+            # starts on the last plot by design
+            curved = pts[k0:] if k0 else pts
+            near = min((math.hypot(x - qx, y - qy), n)
+                       for n, (qx, qy) in enumerate(plots)
+                       for x, y, _, _ in curved[::4]) if plots else (99.0, None)
+            plot_labels = [m["label"] for m in marks if not is_headland(m)]
+            length = sum(math.hypot(pts[k][0] - pts[k - 1][0],
+                                    pts[k][1] - pts[k - 1][1])
+                         for k in range(1, len(pts)))
+            out.append({"after": marks[i - 1]["label"],
+                        "points": [m["label"] for m in chain],
+                        "length": length, "fwd": fwd, "left": left,
+                        "right": right, "near_m": near[0],
+                        "near_plot": plot_labels[near[1]]
+                        if near[1] is not None else None})
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def print_turns(turns):
+    if HEADLAND_TURN != "arc":
+        print("\n  headland turns: pivot (stop on each point, turn in place)")
+        return
+    if not turns:
+        return
+    print(f"\n  headland turns: rolling curves, radius {ARC_RADIUS_M:.1f} m")
+    for t in turns:
+        warn = ""
+        if t["near_m"] < ARC_PLOT_CLEAR_M:
+            warn = (f"   <- passes {t['near_m']:.1f} m from {t['near_plot']}"
+                    f": headland too short for this radius?")
+        print(f"  after {t['after']:<8} via {' > '.join(t['points']):<20} "
+              f"{t['length']:5.1f} m, reaches {t['fwd']:.1f} m out, "
+              f"{t['left']:.1f} m left / {t['right']:.1f} m right{warn}")
 
 
 def cmd_plan(args):
@@ -1408,8 +1924,10 @@ def cmd_plan(args):
     frame = Frame(marks[0]["lat"], marks[0]["lon"])
     legs = plan_legs(frame, marks, frame.to_xy(marks[0]["lat"], marks[0]["lon"]),
                      args.heading)
-    print(f"{len(marks)} marks from {args.path}\n")
-    print_plan(legs)
+    print(f"{len(marks)} marks from {args.path}")
+    print(vehicle.describe() + "\n")
+    print_plan(legs, marks)
+    print_turns(plan_turns(frame, marks))
     return 0
 
 
@@ -1547,8 +2065,10 @@ def cmd_mission(args):
 
         cx, cy = control_point(frame, rover.lat, rover.lon, rover.heading)
         legs = plan_legs(frame, todo, (cx, cy), args.heading)
-        print(f"{len(todo)} waypoints\n")
-        print_plan(legs)
+        print(f"{len(todo)} waypoints")
+        print(vehicle.describe() + "\n")
+        print_plan(legs, todo)
+        print_turns(plan_turns(frame, todo))
         print()
         if args.heading is not None:
             print(f"NOTE: --heading {args.heading:.1f} overrides the taught "
@@ -1566,22 +2086,37 @@ def cmd_mission(args):
             print(f"run log -> {run_path}\n")
 
             tell(state="running", total=len(todo), run_log=run_path)
-            for idx, m in enumerate(todo, 1):
+            full_index = {mk["label"]: k for k, mk in enumerate(marks)}
+            i = 0
+            while i < len(todo):
+                k_full = full_index[todo[i]["label"]]
+                prev = marks[k_full - 1] if k_full > 0 else None
+                ctl, target_i, passed = plan_mission_leg(
+                    frame, rover, todo, i, prev, args.heading)
+                m = todo[target_i]
+                idx = target_i + 1
+                i = target_i + 1
                 label = m["label"]
                 current = label
                 tell(state="driving", label=label, index=idx, total=len(todo))
                 tx, ty = frame.to_xy(m["lat"], m["lon"])
-                cx, cy = control_point(frame, rover.lat, rover.lon,
-                                       rover.heading)
-                final_hdg = final_heading_for(m, bearing_to(tx - cx, ty - cy),
-                                              args.heading)
-                ctl = GotoController(frame, tx, ty, final_hdg)
+                final_hdg = getattr(ctl, "final_heading", None)
+                ref_hdg = (m["heading"] if m.get("heading") is not None
+                           else final_hdg)
                 stats = {}
                 why = drive_loop(
                     rover, ctl.step, label=f"{label}  ",
                     on_resume=ctl.on_resume, stats=stats,
                     notify=lambda ev, why, lab=label: tell(
                         state=ev, label=lab, detail=why))
+                if why == "complete":
+                    for pm in passed:
+                        # headland points the curve rolled through
+                        w.writerow([datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"), pm["label"], "passed"]
+                            + [""] * (len(RUN_COLUMNS) - 3))
+                        done_fh.write(pm["label"] + "\n")
+                    done_fh.flush()
                 if why != "complete":
                     w.writerow([datetime.now(timezone.utc).isoformat(
                         timespec="seconds"), label, f"stopped: {why}"]
@@ -1593,7 +2128,7 @@ def cmd_mission(args):
                     return 1
 
                 err, along, cross, herr = stop_error(frame, rover, tx, ty,
-                                                     final_hdg)
+                                                     ref_hdg)
                 rc = capture_link.parse_plot_label(label)
                 print(f"  {label}: stopped {err*100:.1f} cm from target "
                       f"(along {along*100:+.1f}, cross {cross*100:+.1f} cm)")
@@ -1616,7 +2151,7 @@ def cmd_mission(args):
                     gps_ok = rover.gps_fault(now) is None
                     fix_q, corr_age = rover.fix_q, rover.corr_age
                     err, along, cross, herr = stop_error(frame, rover, tx, ty,
-                                                         final_hdg)
+                                                         ref_hdg)
                     nav = {"run_id": stamp,
                            "teach_file": os.path.basename(args.path),
                            "mark_label": label, "trigger": args.capture_mode,
@@ -1846,6 +2381,7 @@ def cmd_yaw_test(args):
         if not wait_ready(rover):
             return 1
         rover.angular_floor = False     # send exactly what is asked
+        rover.ramp = False
         yt = YawTest(args.speed, rates, args.secs)
         print("  q to stop\n")
         why = drive_loop(rover, yt.step, label="yaw  ", on_resume=yt.on_resume)
@@ -1899,6 +2435,26 @@ def cmd_calib_offset(args):
     finally:
         rover.close()
     return 0
+
+
+def apply_profile(overrides=None):
+    """Replace constants with the machine profile's "nav" values
+    (vehicle.py loads ~/amiga_vehicle.json). Unknown names are reported,
+    not silently ignored - a typo would otherwise run on the defaults."""
+    src = vehicle.NAV_OVERRIDES if overrides is None else overrides
+    unknown = []
+    for k, v in src.items():
+        if k.isupper() and k in globals() and not callable(globals()[k]):
+            globals()[k] = v
+        else:
+            unknown.append(k)
+    if unknown:
+        print(f"note: machine profile settings not known to amiga_nav, "
+              f"ignored: {', '.join(unknown)}", file=sys.stderr)
+    return unknown
+
+
+apply_profile()
 
 
 def main():
