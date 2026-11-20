@@ -190,4 +190,6 @@ navigation. Tested in simulation only.
 red -> green, headland points counted per turn, a warning when a row is
 started without both turn points). Teach logic moved into one class shared
 with the terminal; the teach file is saved after every mark; fixed undo
-after skip naming the wrong plot. `CHANGES-2026-11-20.md`.
+after skip naming the wrong plot. Plots are marked with `t` (was `n`,
+next to `m`); a skipped plot can be clicked to come back and teach it.
+`CHANGES-2026-11-20.md`.

@@ -711,7 +711,7 @@ class ForwarderMode(unittest.TestCase):
             la, lo, raw = antenna_reading(frame, -0.7, 3.1, 200.0, rng, 0.006)
             return la, lo, raw, 4
 
-        keys = [(0.6, "n"), (4.4, "q")]
+        keys = [(0.6, "t"), (4.4, "q")]           # t = plot (was n until 20 Nov)
 
         class Stdin:
             def fileno(self):

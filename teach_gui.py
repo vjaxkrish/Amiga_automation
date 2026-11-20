@@ -11,7 +11,7 @@ new. What it adds is the picture:
     yellow  averaging now (hold still)
     green   taught
     grey    skipped (s)
-    blue    border = the plot the next 'n' will mark
+    blue    border = the plot the next 't' will mark
 
 and, at the end of each row on the side where the turn is, how many
 headland points ('m') have been taught for that turn. A turn needs two:
@@ -24,10 +24,18 @@ one about 5 m past the row's last plot, and one lined up on the next row
     python3 teach_gui.py --demo                fake GPS - try it on a laptop
 
 Keys (click the window first so it has the keyboard):
-    n   mark the next plot              m   mark a headland point
+    t   mark the next plot              m   mark a headland point
     s   skip the next plot (missing)    u   undo the last mark or skip
     q   save and quit                   (the file is also saved after
                                          every mark, so a crash loses nothing)
+    'n' does nothing - it sits next to 'm', so plots moved to 't'.
+
+Coming back for a skipped plot: CLICK it (grey, or any red plot). It gets
+the blue border and the next 't' teaches it; after that the usual order
+carries on. Esc (or clicking it again) cancels. The robot drives marks in
+the order they were taught, so it will drive to that plot at that point in
+the run, straight from the previous mark: if plots are in the way, mark
+headland points ('m') to route around them first.
 
 The plot map comes from the camera app's plot_maps_config.py: --maps-file,
 else $TURF_CAMERA_DIR, else a few usual places (see find_maps_file).
@@ -272,9 +280,11 @@ class TeachWindow:
         if ragged:
             self.log("This map has rows of different lengths; plot names "
                      f"use {cols} columns.", "warn")
-        for k in ("n", "m", "s", "u", "q", "f"):
+        for k in ("t", "n", "m", "s", "u", "q", "f"):
             self.root.bind(f"<KeyPress-{k}>", self.on_key)
             self.root.bind(f"<KeyPress-{k.upper()}>", self.on_key)
+        self.root.bind("<Escape>", lambda e: self.do("escape"))
+        self.canvas.bind("<Button-1>", self.on_click)
         self.root.focus_force()
         self.root.after(5, self.tick)
         self.root.after(200, self.refresh_status)
@@ -283,7 +293,7 @@ class TeachWindow:
     def build(self):
         top = tk.Frame(self.root, bg="white")
         top.pack(fill=tk.X, padx=14, pady=(10, 4))
-        self.lbl_next = tk.Label(top, text="", font=("Arial", 26, "bold"),
+        self.lbl_next = tk.Label(top, text="", font=("Arial", 24, "bold"),
                                  bg="white", anchor="w")
         self.lbl_next.pack(side=tk.LEFT)
         self.lbl_fix = tk.Label(top, text="", font=("Arial", 16, "bold"),
@@ -303,7 +313,7 @@ class TeachWindow:
 
         bar = tk.Frame(self.root, bg="white")
         bar.pack(fill=tk.X, padx=14, pady=4)
-        spec = (("N  mark plot", "n", C_DONE), ("M  headland point", "m", "#6A4FB3"),
+        spec = (("T  mark plot", "t", C_DONE), ("M  headland point", "m", "#6A4FB3"),
                 ("S  skip plot", "s", "#707070"), ("U  undo", "u", "#B35C00"),
                 ("Q  save & quit", "q", "#303030"))
         self.buttons = {}
@@ -356,7 +366,8 @@ class TeachWindow:
         last_row = None
         for m in self.s.marks:
             if m.get("kind") == "plot":
-                last_row = m.get("row")
+                if not m.get("out_of_order"):
+                    last_row = m.get("row")
             else:
                 key = "start" if last_row is None else last_row
                 counts[key] = counts.get(key, 0) + 1
@@ -380,6 +391,7 @@ class TeachWindow:
         ch = min(H / (nrows + 0.6), cw * 0.9)
         y0 = (H - ch * nrows) / 2
         x0 = side + lab_w
+        self.geom = (x0, y0, cw, ch, nrows)
         start = self.s.labeler.start_row
         states = self.plot_states()
         nxt = self.s.next_rc()
@@ -419,6 +431,10 @@ class TeachWindow:
                 if nxt and (r, c) == nxt and (r, c) != pend_rc:
                     cv.create_rectangle(x + 1, y + 1, x + cw - 1, y + ch - 1,
                                         outline=C_NEXT, width=5)
+                    if self.s.picked:
+                        cv.create_text(x + cw - 6, y + 10, anchor="e",
+                                       text="PICKED", fill="white",
+                                       font=("Arial", max(7, fs - 2), "bold"))
                 if flash and (r, c) == flash[:2]:
                     cv.create_rectangle(x + 1, y + 1, x + cw - 1, y + ch - 1,
                                         outline=C_BAD_TURN, width=5)
@@ -426,7 +442,8 @@ class TeachWindow:
         # turns: on the side each row ends, between it and the next row
         counts = self.turn_counts()
         rows_reached = {m["row"] for m in self.s.marks
-                        if m.get("kind") == "plot" and "row" in m}
+                        if m.get("kind") == "plot" and "row" in m
+                        and not m.get("out_of_order")}
         keys = ["start"] + list(range(start, nrows + 1))
         for key in keys:
             n = counts.get(key, 0)
@@ -468,8 +485,13 @@ class TeachWindow:
 
     # ---------------------------------------------------------------- status
     def refresh_status(self):
-        if self.s is None:
+        """Every 200 ms."""
+        if self.s is None or self.s.closed:
             return
+        self.update_status()
+        self.root.after(200, self.refresh_status)
+
+    def update_status(self):
         st = self.s.status(time.monotonic())
         pend = st["averaging"]
         if pend:
@@ -482,10 +504,13 @@ class TeachWindow:
             if rc and rc[0] <= len(self.grid) and rc[1] <= len(self.grid[rc[0] - 1]):
                 geno = self.grid[rc[0] - 1][rc[1] - 1]
             beyond = rc and rc[0] > len(self.grid)
+            picked = self.s.picked is not None
             self.lbl_next.config(
                 text=("all plots in the map are done - m for headland, q to save"
-                      if beyond else f"NEXT:  {nxt}" + (f"   {geno}" if geno else "")),
-                fg=C_NEXT)
+                      if beyond and not picked else
+                      f"NEXT:  {nxt}" + (f"   {geno}" if geno else "")
+                      + ("  (picked)" if picked else "")),
+                fg="#6A4FB3" if picked else C_NEXT)
         fixed = st["fix_q"] == "4" and not st["stale"]
         self.lbl_fix.config(text=("RTK FIXED" if fixed else
                                   (st["fix"].upper() if not st["stale"] else
@@ -508,11 +533,10 @@ class TeachWindow:
             text=f"{self.map_name}  |  plots taught {done}   skipped {skipped}   "
                  f"left {total - done - skipped}   |  headland points {heads}"
                  f"   |  refused {self.s.rejected}   |  saved after every mark")
-        for k in ("n", "m", "s", "u"):
+        for k in ("t", "m", "s", "u"):
             self.buttons[k].config(state=tk.DISABLED if pend else tk.NORMAL)
         if pend or (self.flash and self.flash[2] > time.monotonic() - 0.3):
             self.draw()
-        self.root.after(200, self.refresh_status)
 
     # ---------------------------------------------------------------- loop
     def tick(self):
@@ -541,9 +565,10 @@ class TeachWindow:
 
     def check_turn_after(self, mark):
         """Warn when a new row is started without two turn points."""
-        if mark.get("kind") != "plot":
+        if mark.get("kind") != "plot" or mark.get("out_of_order"):
             return
-        plots = [m for m in self.s.marks if m.get("kind") == "plot"]
+        plots = [m for m in self.s.marks if m.get("kind") == "plot"
+                 and not m.get("out_of_order")]
         if len(plots) < 2:
             return
         prev = plots[-2]
@@ -554,7 +579,7 @@ class TeachWindow:
             self.log(f"Row {mark['row']} started with only {n} headland "
                      f"point(s) after row {prev['row']} - the robot would cut "
                      f"the corner. Press u, then m for the missing turn "
-                     f"point(s), then n again.", "bad")
+                     f"point(s), then t again.", "bad")
             self.root.bell()
 
     # ---------------------------------------------------------------- keys
@@ -574,9 +599,19 @@ class TeachWindow:
             self.log(f"DEMO: fix now {'RTK fixed' if self.demo_feed.fixed else 'FLOAT'}",
                      "warn")
             return
+        if key == "n":
+            self.log("'n' does nothing now - plots are marked with t "
+                     "(n sits next to m).", "warn")
+            return
         if s.pending is not None:
             return
-        if key == "n":
+        if key == "escape":
+            if s.picked:
+                s.pick(None, None)
+                self.log(f"pick cancelled - next is {s.next_plot()} again")
+                self.draw()
+            return
+        if key == "t":
             rc = s.next_rc()
             if rc and rc[0] > len(self.grid):
                 self.log("Every plot in the map is already taught or skipped.",
@@ -589,8 +624,11 @@ class TeachWindow:
             self.log(f"{label} (headland): hold still, averaging "
                      f"{MARK_AVG_S:.0f} s ...")
         elif key == "s":
+            had_pick = s.picked is not None
             name = s.skip()
-            if name:
+            if had_pick:
+                self.log(f"pick cancelled - next is {s.next_plot()} again")
+            elif name:
                 self.log(f"skipped {name} (not marked, will not be driven)",
                          "warn")
         elif key == "u":
@@ -598,6 +636,34 @@ class TeachWindow:
             self.log("nothing to undo" if r is None
                      else f"UNDONE {r[0]} {r[1]}", "warn")
         self.draw()
+        self.update_status()
+
+    def on_click(self, ev):
+        s = self.s
+        if s is None or not getattr(self, "geom", None):
+            return
+        x0, y0, cw, ch, nrows = self.geom
+        c = int((ev.x - x0) // cw) + 1
+        r = int((ev.y - y0) // ch) + 1
+        if not (1 <= r <= nrows and 1 <= c <= len(self.grid[r - 1])):
+            return
+        if s.picked == (r, c):
+            self.do("escape")
+            return
+        why = s.pick(r, c)
+        if why:
+            self.log(why, "warn")
+            return
+        if s.picked is None:
+            self.log(f"{s.next_plot()} is the next plot in order anyway")
+        else:
+            self.log(f"Picked R{r}_C{c}: drive there and press t. The robot "
+                     f"will drive to it at this point in the run, straight "
+                     f"from the last mark - if plots are in the way, mark "
+                     f"headland points (m) around them first. Esc cancels.",
+                     "warn")
+        self.draw()
+        self.update_status()
 
     def quit(self):
         if self.s is not None and not self.s.closed:

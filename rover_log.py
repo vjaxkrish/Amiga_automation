@@ -12,11 +12,12 @@ there is nothing to stop or start. Only if the service is NOT running does
 this open the radio and receiver itself and forward RTCM on its own.
 
     python3 rover_log.py drive              log a manual driving run
-    python3 rover_log.py teach              same, but 'm' marks a waypoint
+    python3 rover_log.py teach              same, but 't' / 'm' mark waypoints
     python3 rover_log.py check              one-shot: are all three sources alive
 
     python3 teach_gui.py --map "2023 SA NTEP"   the same teach, with the plot
-            map on screen: plots turn green as they are marked
+            map on screen: plots turn green as they are marked, and a
+            skipped plot can be clicked to come back and teach it
 
     python3 rover_log.py drive --cols 9 --start-row 1
             teach with plot-map names: plots are labelled R{row}_C{col}
@@ -27,8 +28,9 @@ this open the radio and receiver itself and forward RTCM on its own.
 While running:
     m       mark the current position (teach mode: a plot centre;
             with --cols: a headland point, never captured)
-    n       mark and label the next plot (plot_001... or, with --cols,
-            the next R{row}_C{col})
+    t       mark and label the next plot (plot_001... or, with --cols,
+            the next R{row}_C{col}). Was 'n' until 20 Nov; 'n' now does
+            nothing, because it sits next to 'm'.
     s       with --cols: skip the next plot name without marking (a plot
             that is missing or cannot be reached)
     u       undo the last mark or skip (plot names go back to where they were)
@@ -528,7 +530,8 @@ class TeachSession:
         self.gps, self.att, self.can = Source(), Source(), Source()
         self.marks = []
         self.skipped = []          # plot names skipped, in order
-        self.history = []          # undo stack: (action, labeler.k before)
+        self.history = []          # undo stack: (action, name, k before, extra)
+        self.picked = None         # (row, col) chosen out of order, or None
         self.pending = None        # a mark being averaged
         self.rejected = 0
         self.rows = 0
@@ -542,10 +545,52 @@ class TeachSession:
 
     # -- what the screen shows ------------------------------------------
     def next_plot(self):
+        if self.picked:
+            return f"R{self.picked[0]}_C{self.picked[1]}"
         return self.labeler.current()
 
     def next_rc(self):
-        return self.labeler.rc() if self.grid else None
+        if not self.grid:
+            return None
+        return self.picked or self.labeler.rc()
+
+    def taught_rcs(self):
+        return {(m["row"], m["col"]) for m in self.marks
+                if m.get("kind") == "plot" and "row" in m}
+
+    def pick(self, row, col):
+        """Make (row, col) the plot the next plot mark teaches, out of the
+        usual order - to come back for a plot that was skipped. Afterwards
+        the order carries on from where it was. Returns None if accepted,
+        else the reason. pick(None, None) cancels."""
+        if not self.grid:
+            return "plot picking needs a plot map (--cols)"
+        if self.pending is not None:
+            return "a mark is averaging - wait for it"
+        if row is None:
+            self.picked = None
+            return None
+        if row < 1 or not 1 <= col <= self.labeler.cols:
+            return f"R{row}_C{col} is not in the map"
+        if (row, col) in self.taught_rcs():
+            return (f"R{row}_C{col} is already taught (u undoes the last "
+                    f"mark only)")
+        if (row, col) == self.labeler.rc():
+            self.picked = None          # that is the normal next plot anyway
+            return None
+        self.picked = (row, col)
+        return None
+
+    def _advance_past_taught(self):
+        """Step the order on, over any plot already taught out of order."""
+        self.labeler.advance()
+        if not self.grid:
+            return
+        taught = self.taught_rcs()
+        for _ in range(10000):
+            if self.labeler.rc() not in taught:
+                break
+            self.labeler.advance()
 
     def status(self, now):
         g, a, c = self.gps.data, self.att.data, self.can.data
@@ -576,20 +621,27 @@ class TeachSession:
             return None
         now = time.monotonic() if now is None else now
         numbered = kind == "plot" or (self.teach and not self.grid)
-        label = (self.labeler.current() if numbered
+        label = (self.next_plot() if numbered
                  else f"mark_{len(self.marks) + 1}")
         self.pending = {"label": label, "numbered": numbered,
+                        "rc": self.next_rc() if numbered else None,
+                        "picked": bool(numbered and self.picked),
                         "t_end": now + MARK_AVG_S,
                         "gga": [], "hdg": [], "spd": []}
         return label
 
     def skip(self):
+        """Skip the next plot in the usual order. With a plot picked, that
+        pick is cancelled instead (nothing is skipped)."""
         if self.pending is not None or not self.grid:
             return None
+        if self.picked:
+            self.picked = None
+            return None
         name = self.labeler.current()
-        self.history.append(("skip", name, self.labeler.k))
+        self.history.append(("skip", name, self.labeler.k, None))
         self.skipped.append(name)
-        self.labeler.advance()
+        self._advance_past_taught()
         self.save()
         return name
 
@@ -599,14 +651,17 @@ class TeachSession:
         if self.pending is not None or not self.history:
             return None
         now = time.monotonic() if now is None else now
-        action, what, k_before = self.history.pop()
+        action, what, k_before, extra = self.history.pop()
         self.labeler.k = k_before
+        self.picked = None
         if action == "skip":
             self.skipped.remove(what)
         else:
             gone = self.marks.pop()
             self.snapshot(now, "mark_undone", gone["label"])
             what = gone["label"]
+            if extra and extra.get("was_skipped"):
+                self.skipped.append(what)     # back to grey, not red
         self.save()
         return action, what
 
@@ -663,12 +718,23 @@ class TeachSession:
         mark = {"t_mono": v["t_mono"], "t_utc": v["t_utc"], "label": label,
                 "kind": "plot" if p["numbered"] else "headland"}
         if self.grid and p["numbered"]:
-            mark["row"], mark["col"] = self.labeler.rc()
+            mark["row"], mark["col"] = p["rc"]
+        if p["picked"]:
+            mark["out_of_order"] = True
         mark.update(fields)
-        self.history.append(("mark", label, self.labeler.k))
+        was_skipped = label in self.skipped
+        self.history.append(("mark", label, self.labeler.k,
+                             {"was_skipped": was_skipped}))
+        if was_skipped:
+            self.skipped.remove(label)        # taught after all
         self.marks.append(mark)
         if p["numbered"]:
-            self.labeler.advance()
+            if p["picked"]:
+                self.picked = None            # back to the usual order
+                if self.labeler.rc() in self.taught_rcs():
+                    self._advance_past_taught()
+            else:
+                self._advance_past_taught()
         self.save()
         return ("mark",
                 f"MARK {label}  {fields['lat']:.9f},{fields['lon']:.9f}  "
@@ -782,10 +848,10 @@ def cmd_log(args):
     if grid:
         print(f"  plot names from the map grid, {args.cols} columns, starting "
               f"at row {s.labeler.start_row}: first plot is {s.next_plot()}")
-        print("  n = plot   m = headland point   s = skip a plot   "
+        print("  t = plot   m = headland point   s = skip a plot   "
               "u = undo   q = save")
     else:
-        print("  m = mark    n = mark as next plot id    u = undo    q = stop")
+        print("  m = mark    t = mark as next plot id    u = undo    q = stop")
     if feed.name == "rtcm_forward":
         print("  GNSS via rtcm_forward (the service keeps forwarding corrections)")
     else:
@@ -810,8 +876,11 @@ def cmd_log(args):
                 c = sys.stdin.read(1).lower()
                 if c == "q":
                     break
-                if c in ("m", "n") and s.pending is None:
-                    label = s.mark("plot" if c == "n" else "headland", now)
+                if c == "n":
+                    sys.stdout.write(f"\r  'n' does nothing now - plots are "
+                                     f"'t' (n sits next to m){pad}\n")
+                elif c in ("m", "t") and s.pending is None:
+                    label = s.mark("plot" if c == "t" else "headland", now)
                     sys.stdout.write(f"\r  {label}: hold still, averaging "
                                      f"{MARK_AVG_S:.0f} s ...{pad}\n")
                 elif c == "s" and grid and s.pending is None:
